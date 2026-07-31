@@ -45,6 +45,17 @@ READ_INTERVAL_SEC = 2
 BASE_ADDRESS = 4096
 REGISTER_COUNT = 12
 
+# Motor: TOPSFLO TM30A mini diaphragm pump -- rated 12V, ~0.4A no-load draw.
+# CURRENT_SCALE = 0.04 was matching the no-load spec (0.4A) exactly, but
+# under actual running/load conditions the pump draws more than at
+# no-load, so the target range is ~0.8-1A while running. Doubled the
+# scale (0.04 -> 0.08) to move the same raw register reading up from
+# 0.4A into that 0.8A+ band. This is still a linear estimate off one
+# data point -- once you've got a clamp-meter reading while the pump is
+# actually running under load, adjust this single constant to match it
+# precisely.
+CURRENT_SCALE = 0.08
+
 # Simple (single-register) values: (key, index, scale, unit)
 SIMPLE_REGISTERS = [
     ("temperature",     0,  0.01,  "°C"),    # CONFIRMED: raw / 100
@@ -52,7 +63,7 @@ SIMPLE_REGISTERS = [
     ("wind_speed",       6,  0.1,   "m/s"),   # UNCONFIRMED -- verify with anemometer datasheet
     ("wind_direction",   7,  1,     ""),      # raw code (2=Right, 3=Left) -- no unit
     ("motor_voltage",    8,  1,     "V"),     # UNCONFIRMED -- verify with voltage sensor datasheet. Raw register is already in whole volts (matches ~10-12V supply, see test1.py output), NOT tenths -- previously scaled by 0.1 which gave 1.0-1.1V instead of ~10-11V.
-    ("motor_current",    9,  0.4,   "A"),     # RESCALED: raw ~9-10 was being shown as 9-10A directly (too high for a 12V motor). scale=0.4 maps raw 9-10 -> ~3.6-4.0A, within the expected 2-5A range. APPROXIMATE -- verify with a clamp meter for precise calibration.
+    ("motor_current",    9,  CURRENT_SCALE,   "A"),  # RESCALED for TOPSFLO TM30A -- see CURRENT_SCALE above. Sent to ThingsBoard as a full, unrounded float (see read_plc_data).
     ("motor_power_plc_raw", 10,  1,  "W"),     # PLC's own internal power calc -- kept only for reference/diagnostics, NOT used for the "motor_power" telemetry key anymore (see calculated version below)
     ("motor_control",   11,  1,     ""),      # raw 0/1 state, no scaling
 ]
@@ -80,6 +91,14 @@ MOTOR_CONTROL_WRITE_ADDRESS = BASE_ADDRESS + 11   # 4107
 UNITS = {key: unit for key, *_rest, unit in SIMPLE_REGISTERS}
 UNITS.update({key: unit for key, *_rest, unit in COMBINED_REGISTERS})
 UNITS["motor_power"] = "W"   # calculated field (V x I), not in SIMPLE_REGISTERS anymore
+
+# TOPSFLO TM30A rated flow while running. Sent as a fixed value whenever the
+# motor is ON (per the PLC's own motor_control register), 0 when it's OFF.
+MOTOR_FLOW_RATE_LPM = 6
+UNITS["flow_rate"] = "L/min"   # calculated/derived field, not in SIMPLE_REGISTERS
+UNITS["motor_uptime_min"] = "min"
+UNITS["motor_downtime_min"] = "min"
+UNITS["motor_total_running_min"] = "min"
 
 # Stored motor state for widget RPC responses.
 current_motor_state = 0
@@ -150,7 +169,12 @@ def read_plc_data(client):
         # handle negative values represented as unsigned 16-bit (two's complement)
         if raw > 32767:
             raw -= 65536
-        value = round(raw * scale, 3)
+        if key == "motor_current":
+            # send the full, unrounded float straight to ThingsBoard --
+            # whatever the raw*scale math produces, no round() truncation
+            value = raw * scale
+        else:
+            value = round(raw * scale, 3)
         data[key] = value
 
     # Motor power, computed from our own calibrated voltage/current
@@ -175,6 +199,16 @@ def read_plc_data(client):
     # side effects changing the raw 2/3 code.
     raw_direction = regs[7]
     data["wind_direction_text"] = WIND_DIRECTION_MAP.get(raw_direction, "Unknown")
+
+    # Flow rate telemetry -- TOPSFLO TM30A moves ~4 L/min while running,
+    # 0 when off. Driven off the PLC's own motor_control register (the
+    # actual hardware state just read above), not the RPC-cached
+    # current_motor_state variable, so it always reflects reality even if
+    # someone flips the motor from the PLC side instead of the dashboard.
+    data["flow_rate"] = MOTOR_FLOW_RATE_LPM if data["motor_control"] else 0
+
+    # Uptime / downtime / cumulative running-hours tracking
+    data.update(update_motor_runtime(data["motor_control"]))
 
     # Derived IAQ (air quality) index from gas resistance
     iaq_score, iaq_label = compute_iaq(data["gas_resistance"])
@@ -222,6 +256,76 @@ def compute_iaq(gas_resistance_ohm):
         label = "Very Poor"
 
     return iaq_score, label
+
+
+# ======================================================================
+# 3b. MOTOR UPTIME / DOWNTIME / TOTAL RUNTIME TRACKING
+# ======================================================================
+# Counters are advanced by READ_INTERVAL_SEC on every successful poll
+# (not by wall-clock delta) -- since the main loop already sleeps for a
+# fixed READ_INTERVAL_SEC between reads, this stays accurate as long as
+# reads aren't stalling for long stretches. total_running_sec is
+# persisted to a small JSON file so cumulative running hours survive
+# script restarts (PC reboot, crash, manual restart, etc).
+
+RUNTIME_STATE_FILE = "motor_runtime_state.json"
+RUNTIME_SAVE_EVERY_N_READS = 30   # persist to disk roughly once a minute at 2s interval, not every single read
+
+motor_uptime_sec = 0        # continuous seconds the motor has been ON, right now
+motor_downtime_sec = 0      # continuous seconds the motor has been OFF, right now
+total_running_sec = 0.0     # all-time cumulative running seconds (persisted)
+_runtime_save_counter = 0
+
+
+def load_runtime_state():
+    """Restore total_running_sec from disk on startup, if a previous run saved one."""
+    global total_running_sec
+    try:
+        with open(RUNTIME_STATE_FILE, "r") as f:
+            saved = json.load(f)
+            total_running_sec = saved.get("total_running_sec", 0.0)
+            print(f"[runtime] Loaded persisted total running time: "
+                  f"{total_running_sec / 3600:.2f} h")
+    except (FileNotFoundError, json.JSONDecodeError):
+        total_running_sec = 0.0
+        print("[runtime] No previous runtime state found -- starting from 0.")
+
+
+def save_runtime_state():
+    try:
+        with open(RUNTIME_STATE_FILE, "w") as f:
+            json.dump({"total_running_sec": total_running_sec}, f)
+    except Exception as e:
+        print("Error saving runtime state:", e)
+
+
+def update_motor_runtime(motor_state):
+    """
+    Advances uptime/downtime/total-runtime counters based on the motor's
+    current ON/OFF state (from the motor_control register), and returns
+    the values to attach to the telemetry payload. Also periodically
+    persists total_running_sec to disk.
+    """
+    global motor_uptime_sec, motor_downtime_sec, total_running_sec, _runtime_save_counter
+
+    if motor_state:
+        motor_uptime_sec += READ_INTERVAL_SEC
+        motor_downtime_sec = 0
+        total_running_sec += READ_INTERVAL_SEC
+    else:
+        motor_downtime_sec += READ_INTERVAL_SEC
+        motor_uptime_sec = 0
+
+    _runtime_save_counter += 1
+    if _runtime_save_counter >= RUNTIME_SAVE_EVERY_N_READS:
+        save_runtime_state()
+        _runtime_save_counter = 0
+
+    return {
+        "motor_uptime_min": round(motor_uptime_sec / 60, 2),
+        "motor_downtime_min": round(motor_downtime_sec / 60, 2),
+        "motor_total_running_min": round(total_running_sec / 60, 2),
+    }
 
 
 def write_motor_control(client, state: int):
@@ -296,6 +400,8 @@ def mqtt_loop():
 # ======================================================================
 
 def main():
+    load_runtime_state()
+
     if not plc_client.connect():
         print("PLC (USR-W630) Connection Failed")
         return
@@ -342,6 +448,7 @@ def main():
         print("\nStopped by user")
 
     finally:
+        save_runtime_state()   # flush any not-yet-persisted running time before exit
         plc_client.close()
         tb_client.disconnect()
 
