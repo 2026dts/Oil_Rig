@@ -5,12 +5,15 @@ Local Flask dashboard styled like the DG monitor: tabbed navigation,
 widget cards (radial gauges, band bars, thermometer, rings, trends,
 segmented motor switch) and a System Health & Diagnostics matrix.
 
+UPDATED: Tracks total_idle_sec alongside total_running_sec for cumulative
+idle time accumulation (persisted to disk, survives restart).
+
 Pages:
     /              Overview (all widgets + health matrix)
     /motor         Pump Control: ON/OFF switch only
     /anemometer    Wind gauge, Beaufort scale, stats, trend
     /temperature   Thermometer, humidity ring, barometer, trends
-    /pump          Pump Monitor: voltage, current, power, running time, total run time
+    /pump          Pump Monitor: voltage, current, power, running time, idle time
 
 HTTP APIs:
     GET  /api/motor
@@ -20,7 +23,7 @@ HTTP APIs:
     GET  /api/temperature
     GET  /api/pump
     GET  /api/all
-    GET  /api/history      (new: rolling in-memory history for trend widgets)
+    GET  /api/history
 
 Wind watchdog (backend), two rules:
     Rule 1: pump RUNNING and wind reads 0 m/s continuously for 10 s.
@@ -158,6 +161,7 @@ latest_data = {
     "motor_uptime_min": 0,
     "motor_downtime_min": 0,
     "motor_total_running_min": 0,
+    "motor_total_idle_min": 0,  # NEW: total idle time (cumulative)
     "connected": False,
     "last_update": None,
 }
@@ -177,6 +181,7 @@ history = deque(maxlen=HISTORY_LEN)
 motor_uptime_sec = 0
 motor_downtime_sec = 0
 total_running_sec = 0.0
+total_idle_sec = 0.0  # NEW: cumulative idle time
 _runtime_save_counter = 0
 
 _last_wind_raw = None
@@ -199,28 +204,34 @@ _last_manual_command_at = 0.0      # time of last ON/OFF click on the dashboard
 # ----------------------------------------------------------------------
 
 def load_runtime_state():
-    global total_running_sec
+    global total_running_sec, total_idle_sec
     try:
         with open(RUNTIME_STATE_FILE, "r") as f:
             saved = json.load(f)
             total_running_sec = float(saved.get("total_running_sec", 0.0))
-        print(f"[runtime] Loaded total runtime: {total_running_sec / 3600:.2f} h")
+            total_idle_sec = float(saved.get("total_idle_sec", 0.0))
+        print(f"[runtime] Loaded total running: {total_running_sec / 3600:.2f} h")
+        print(f"[runtime] Loaded total idle: {total_idle_sec / 3600:.2f} h")
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
         total_running_sec = 0.0
-        print("[runtime] Starting runtime counter from 0.")
+        total_idle_sec = 0.0
+        print("[runtime] Starting runtime and idle counters from 0.")
 
 
 def save_runtime_state():
     try:
         with open(RUNTIME_STATE_FILE, "w") as f:
-            json.dump({"total_running_sec": total_running_sec}, f)
+            json.dump({
+                "total_running_sec": total_running_sec,
+                "total_idle_sec": total_idle_sec
+            }, f)
     except Exception as exc:
         print("[runtime] Save error:", exc)
 
 
 def update_motor_runtime(motor_state):
     global motor_uptime_sec, motor_downtime_sec
-    global total_running_sec, _runtime_save_counter
+    global total_running_sec, total_idle_sec, _runtime_save_counter
 
     if motor_state:
         motor_uptime_sec += READ_INTERVAL_SEC
@@ -229,6 +240,7 @@ def update_motor_runtime(motor_state):
     else:
         motor_downtime_sec += READ_INTERVAL_SEC
         motor_uptime_sec = 0
+        total_idle_sec += READ_INTERVAL_SEC
 
     _runtime_save_counter += 1
     if _runtime_save_counter >= RUNTIME_SAVE_EVERY_N_READS:
@@ -239,6 +251,7 @@ def update_motor_runtime(motor_state):
         "motor_uptime_min": round(motor_uptime_sec / 60, 2),
         "motor_downtime_min": round(motor_downtime_sec / 60, 2),
         "motor_total_running_min": round(total_running_sec / 60, 2),
+        "motor_total_idle_min": round(total_idle_sec / 60, 2),
     }
 
 
@@ -686,6 +699,7 @@ def api_motor():
         "motor_uptime_min",
         "motor_downtime_min",
         "motor_total_running_min",
+        "motor_total_idle_min",
         "connected",
         "last_update",
     ]))
@@ -1771,6 +1785,7 @@ def home_page():
             tile("duty", "Duty cycle", "activity", "violet"),
             tile("run", "Current run", "clock", "blue"),
             tile("total", "Total running", "clock", "green"),
+            tile("idle", "Total idle time", "clock", "red"),
         ])
         + f'<div class="section-h"><span class="ic">{icon("fan")}</span>Pump Activity</div>'
         + '<div class="widgets">'
@@ -1879,6 +1894,8 @@ def home_page():
             ? ["ok", "Up " + fmtDuration(d.motor_uptime_min)]
             : ["warn", "Down " + fmtDuration(d.motor_downtime_min)]);
         setTile("total", tot === null ? ["idle", "No data"] : ["ok", (tot / 60).toFixed(2) + " h"]);
+        const idle = num(d.motor_total_idle_min);
+        setTile("idle", idle === null ? ["idle", "No data"] : ["warn", (idle / 60).toFixed(2) + " h"]);
 
         /* environment trends */
         Trend.draw("ov-t-trend", series(h, "temperature"), {color: "#f59e0b", decimals: 1, unit: "°"});
@@ -2037,10 +2054,6 @@ def pump_page():
         + widget("Power", "Voltage x current", "gauge", power_body,
                  "Rated", f'<b>{UI_LIMITS["power"]["max"]} W</b>',
                  badge_id="pu-p-badge", icon_tone="violet")
-        + widget("Run Time", "Since the pump last started", "clock", kpi("up", "min"),
-                 "Duration", '<b id="up-sub">--</b>', badge_id="up-badge", icon_tone="green")
-        + widget("Total Running", "Saved to disk, survives restarts", "activity", kpi("tot", "h"),
-                 "In minutes", '<b id="tot-sub">--</b>', icon_tone="blue")
         + "</div>"
     )
 
@@ -2074,13 +2087,6 @@ def pump_page():
         setText("pu-power-u", p.u);
         Band.set("pu-p-band", d.motor_power);
         setBadge("pu-p-badge", [ls[0], ls[0] === "ok" ? "Normal" : ls[1]]);
-
-        setText("up", fmt(d.motor_uptime_min, 1));
-        setText("up-sub", fmtDuration(d.motor_uptime_min));
-        setBadge("up-badge", Status.motor(d));
-        const tot = num(d.motor_total_running_min);
-        setText("tot", tot === null ? "--" : (tot / 60).toFixed(2));
-        setText("tot-sub", tot === null ? "--" : tot.toFixed(0) + " min");
     }
     startLoop(refresh);
     </script>
@@ -2098,7 +2104,7 @@ if __name__ == "__main__":
 
     print("")
     print("======================================================")
-    print(" PLC HTTP Dashboard")
+    print(" PLC HTTP Dashboard (with Idle Time Tracking)")
     print("======================================================")
     print(" Overview    : http://localhost:5000/")
     print(" Motor       : http://localhost:5000/motor")
