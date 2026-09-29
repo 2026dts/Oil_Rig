@@ -43,12 +43,14 @@ Then open:
 """
 
 import json
+import sqlite3
 import threading
 import time
 import urllib.request
 from collections import deque
+from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from pymodbus.client import ModbusTcpClient
 
 # ----------------------------------------------------------------------
@@ -90,6 +92,258 @@ COMPACT_UI = True
 # Pages that get a solid white background instead of the see-through one.
 # Keys: "overview", "motor", "anemometer", "temperature", "pump".
 WHITE_BG_PAGES = {"overview"}
+
+# SQLite Database
+DB_PATH = "plc_data.db"
+
+# Wind alarm: one CRITICAL alert per pump run when wind >= this value (m/s).
+# The next alert can only fire after the pump is switched OFF and ON again.
+WIND_ALERT_LIMIT = 2.2
+
+# ----------------------------------------------------------------------
+# SQLITE SETUP
+# ----------------------------------------------------------------------
+
+def init_db():
+    """Create SQLite database and 3 tables if they don't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Table 1: Raw readings (every 2 sec)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            temperature REAL,
+            humidity REAL,
+            pressure REAL,
+            wind_speed REAL,
+            motor_voltage REAL,
+            motor_current REAL,
+            motor_power REAL,
+            motor_state INTEGER
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_readings_timestamp ON readings(timestamp)')
+    
+    # Table 2: Hourly aggregates
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS hourly_agg (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hour_bucket REAL NOT NULL,
+            temp_avg REAL,
+            humidity_avg REAL,
+            pressure_avg REAL,
+            wind_avg REAL,
+            motor_voltage_avg REAL,
+            motor_current_avg REAL,
+            motor_power_avg REAL,
+            motor_running_count INTEGER,
+            sample_count INTEGER
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_hourly_bucket ON hourly_agg(hour_bucket)')
+    
+    # Table 3: Daily aggregates
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_agg (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_date TEXT NOT NULL UNIQUE,
+            temp_min REAL,
+            temp_max REAL,
+            temp_avg REAL,
+            humidity_min REAL,
+            humidity_max REAL,
+            humidity_avg REAL,
+            pressure_min REAL,
+            pressure_max REAL,
+            pressure_avg REAL,
+            wind_max REAL,
+            wind_avg REAL,
+            motor_voltage_avg REAL,
+            motor_current_avg REAL,
+            motor_power_max REAL,
+            motor_power_avg REAL,
+            motor_running_sec REAL,
+            sample_count INTEGER
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_agg(day_date)')
+
+    # Table 4: Alarm inbox (kept forever, like mail)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            level TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT,
+            value REAL,
+            is_read INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    # Small key/value store (alarm arming state survives restarts)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+    print("[DB] Initialized SQLite (readings, hourly_agg, daily_agg, alerts)")
+
+
+def insert_reading(temp, humidity, pressure, wind, voltage, current, power, motor_state):
+    """Insert one raw reading into readings table."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO readings (timestamp, temperature, humidity, pressure, wind_speed,
+                                  motor_voltage, motor_current, motor_power, motor_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (time.time(), temp, humidity, pressure, wind, voltage, current, power, motor_state))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] Error inserting reading: {e}")
+
+
+def aggregate_hourly():
+    """Compute hourly averages from readings."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        now = time.time()
+        hour_ago = now - 3600
+        
+        cursor.execute('''
+            SELECT temperature, humidity, pressure, wind_speed, motor_voltage, 
+                   motor_current, motor_power, motor_state
+            FROM readings
+            WHERE timestamp > ? AND timestamp <= ?
+            ORDER BY timestamp
+        ''', (hour_ago, now))
+        
+        rows = cursor.fetchall()
+        if not rows:
+            conn.close()
+            return
+        
+        temps = [r[0] for r in rows if r[0] is not None]
+        humidities = [r[1] for r in rows if r[1] is not None]
+        pressures = [r[2] for r in rows if r[2] is not None]
+        winds = [r[3] for r in rows if r[3] is not None]
+        voltages = [r[4] for r in rows if r[4] is not None]
+        currents = [r[5] for r in rows if r[5] is not None]
+        powers = [r[6] for r in rows if r[6] is not None]
+        motor_running = sum(1 for r in rows if r[7] == 1)
+        
+        hour_bucket = int(now / 3600) * 3600
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO hourly_agg
+            (hour_bucket, temp_avg, humidity_avg, pressure_avg, wind_avg,
+             motor_voltage_avg, motor_current_avg, motor_power_avg, motor_running_count, sample_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            hour_bucket,
+            sum(temps) / len(temps) if temps else None,
+            sum(humidities) / len(humidities) if humidities else None,
+            sum(pressures) / len(pressures) if pressures else None,
+            sum(winds) / len(winds) if winds else None,
+            sum(voltages) / len(voltages) if voltages else None,
+            sum(currents) / len(currents) if currents else None,
+            sum(powers) / len(powers) if powers else None,
+            motor_running,
+            len(rows)
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] Error in hourly aggregation: {e}")
+
+
+def aggregate_daily():
+    """Compute daily min/max/avg from hourly_agg."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        today = datetime.now().strftime('%Y-%m-%d')
+        day_start = int(datetime.strptime(today, '%Y-%m-%d').timestamp())
+        day_end = day_start + 86400
+        
+        cursor.execute('''
+            SELECT temp_avg, humidity_avg, pressure_avg, wind_avg, motor_power_avg, 
+                   motor_voltage_avg, motor_current_avg, motor_running_count, sample_count
+            FROM hourly_agg
+            WHERE hour_bucket >= ? AND hour_bucket < ?
+        ''', (day_start, day_end))
+        
+        rows = cursor.fetchall()
+        if not rows:
+            conn.close()
+            return
+        
+        temps = [r[0] for r in rows if r[0] is not None]
+        humidities = [r[1] for r in rows if r[1] is not None]
+        pressures = [r[2] for r in rows if r[2] is not None]
+        winds = [r[3] for r in rows if r[3] is not None]
+        powers = [r[4] for r in rows if r[4] is not None]
+        voltages = [r[5] for r in rows if r[5] is not None]
+        currents = [r[6] for r in rows if r[6] is not None]
+        running_counts = [r[7] for r in rows if r[7] is not None]
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO daily_agg
+            (day_date, temp_min, temp_max, temp_avg, humidity_min, humidity_max, humidity_avg,
+             pressure_min, pressure_max, pressure_avg, wind_max, wind_avg,
+             motor_voltage_avg, motor_current_avg, motor_power_max, motor_power_avg, motor_running_sec, sample_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            today,
+            min(temps) if temps else None,
+            max(temps) if temps else None,
+            sum(temps) / len(temps) if temps else None,
+            min(humidities) if humidities else None,
+            max(humidities) if humidities else None,
+            sum(humidities) / len(humidities) if humidities else None,
+            min(pressures) if pressures else None,
+            max(pressures) if pressures else None,
+            sum(pressures) / len(pressures) if pressures else None,
+            max(winds) if winds else None,
+            sum(winds) / len(winds) if winds else None,
+            sum(voltages) / len(voltages) if voltages else None,
+            sum(currents) / len(currents) if currents else None,
+            max(powers) if powers else None,
+            sum(powers) / len(powers) if powers else None,
+            sum(running_counts) * READ_INTERVAL_SEC,
+            len(rows)
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] Error in daily aggregation: {e}")
+
+
+def delete_old_readings(days=7):
+    """Delete raw readings older than N days (keep aggregates forever)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cutoff = time.time() - (days * 86400)
+        cursor.execute('DELETE FROM readings WHERE timestamp < ?', (cutoff,))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        if deleted > 0:
+            print(f"[DB] Deleted {deleted} readings older than {days} days")
+    except Exception as e:
+        print(f"[DB] Error deleting old readings: {e}")
 
 # ----------------------------------------------------------------------
 # WIND WATCHDOG -> RELAY CYCLE
@@ -187,6 +441,10 @@ _runtime_save_counter = 0
 _last_wind_raw = None
 _stale_count = 0
 STALE_THRESHOLD = 10
+
+# SQLite aggregation tracking
+_last_hour_agg = int(time.time() / 3600)
+_last_day_agg = datetime.now().date()
 
 _prev_motor_state = None           # last pump state read from the PLC
 _wind_zero_since = None            # rule 1: time wind first read 0 with the pump running
@@ -584,10 +842,92 @@ def write_motor_control(state):
     return True
 
 
+# ----------------------------------------------------------------------
+# WIND ALARM (one alert per pump run)
+# ----------------------------------------------------------------------
+# Armed when the pump switches OFF -> ON. While armed and the pump is running,
+# the first wind reading >= WIND_ALERT_LIMIT creates ONE critical alert and
+# disarms. Nothing more is raised until the next OFF -> ON.
+
+_alarm_lock = threading.Lock()
+_alarm_armed = None       # loaded from app_state on first use
+_alarm_prev_motor = None
+
+
+def _state_get(key, default=None):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+
+def _state_set(key, value):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[ALARM] state save error: {e}")
+
+
+def insert_alert(level, title, message, value=None):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO alerts (ts, level, title, message, value, is_read) VALUES (?, ?, ?, ?, ?, 0)",
+            (time.time(), level, title, message, value),
+        )
+        conn.commit()
+        conn.close()
+        print(f"[ALARM] {level.upper()}: {title} - {message}")
+    except Exception as e:
+        print(f"[ALARM] insert error: {e}")
+
+
+def check_wind_alarm(data):
+    global _alarm_armed, _alarm_prev_motor
+    with _alarm_lock:
+        if _alarm_armed is None:
+            _alarm_armed = _state_get("wind_alarm_armed", "1") == "1"
+
+        motor = 1 if data.get("motor_control") else 0
+
+        # New pump run -> arm again
+        if _alarm_prev_motor == 0 and motor == 1 and not _alarm_armed:
+            _alarm_armed = True
+            _state_set("wind_alarm_armed", "1")
+        _alarm_prev_motor = motor
+
+        wind = data.get("wind_speed")
+        if not (_alarm_armed and motor == 1 and wind is not None):
+            return
+        try:
+            wind = float(wind)
+        except (TypeError, ValueError):
+            return
+
+        if wind >= WIND_ALERT_LIMIT:
+            _alarm_armed = False
+            _state_set("wind_alarm_armed", "0")
+            insert_alert(
+                "critical",
+                "Critical Wind Speed",
+                f"Wind reached {wind:.1f} m/s while the pump was running "
+                f"(limit {WIND_ALERT_LIMIT} m/s). Strong wind can damage the rig "
+                f"equipment. Check site conditions and consider stopping the pump.",
+                wind,
+            )
+
+
 def plc_polling_loop():
-    global _stale_count
+    global _stale_count, _last_hour_agg, _last_day_agg
 
     load_runtime_state()
+    init_db()
 
     while True:
         try:
@@ -603,7 +943,28 @@ def plc_polling_loop():
                     sample["t"] = data["last_update"]
                     history.append(sample)
 
+                # Insert into SQLite
+                insert_reading(
+                    data["temperature"], data["humidity"], data["pressure"],
+                    data["wind_speed"], data["motor_voltage"], data["motor_current"],
+                    data["motor_power"], data["motor_control"]
+                )
+                
+                # Hourly aggregation
+                now_hour = int(time.time() / 3600)
+                if now_hour > _last_hour_agg:
+                    _last_hour_agg = now_hour
+                    threading.Thread(target=aggregate_hourly, daemon=True).start()
+                
+                # Daily aggregation
+                now_date = datetime.now().date()
+                if now_date > _last_day_agg:
+                    _last_day_agg = now_date
+                    threading.Thread(target=aggregate_daily, daemon=True).start()
+                    threading.Thread(target=lambda: delete_old_readings(7), daemon=True).start()
+
                 watch_wind(data)
+                check_wind_alarm(data)
 
                 print(
                     f"[DATA] T={data['temperature']}C "
@@ -727,6 +1088,195 @@ def api_motor_off():
     }), (200 if success else 503)
 
 
+@app.get("/api/alerts")
+def api_alerts():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, ts, level, title, message, value, is_read FROM alerts ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        unread = conn.execute("SELECT COUNT(*) FROM alerts WHERE is_read = 0").fetchone()[0]
+        conn.close()
+        return jsonify({"alerts": [dict(r) for r in rows], "unread": unread,
+                        "limit": WIND_ALERT_LIMIT})
+    except Exception as e:
+        return jsonify({"alerts": [], "unread": 0, "error": str(e)}), 500
+
+
+@app.post("/api/alerts/<int:alert_id>/read")
+def api_alert_read(alert_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE alerts SET is_read = 1 WHERE id = ?", (alert_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.post("/api/alerts/read_all")
+def api_alert_read_all():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE alerts SET is_read = 1 WHERE is_read = 0")
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.get("/api/graph/<scale>")
+def api_graph(scale):
+    """Time-scale graph data: 1h, 1d, 1w, 1m, 1y."""
+    try:
+        metric = request.args.get('metric', 'temperature')
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        if scale == '1h':
+            # 1 Hour: raw readings data (every 2 seconds)
+            cursor.execute('''
+                SELECT timestamp, temperature, humidity, pressure, wind_speed,
+                       motor_voltage, motor_current, motor_power
+                FROM readings
+                WHERE timestamp >= (datetime('now') - 3600)
+                ORDER BY timestamp ASC
+            ''')
+            rows = cursor.fetchall()
+            
+            result = []
+            for row in rows:
+                result.append({
+                    'timestamp': float(row['timestamp']),
+                    'temperature': float(row['temperature']) if row['temperature'] is not None else None,
+                    'humidity': float(row['humidity']) if row['humidity'] is not None else None,
+                    'pressure': float(row['pressure']) if row['pressure'] is not None else None,
+                    'wind': float(row['wind_speed']) if row['wind_speed'] is not None else None,
+                    'power': float(row['motor_power']) if row['motor_power'] is not None else None,
+                    'voltage': float(row['motor_voltage']) if row['motor_voltage'] is not None else None,
+                    'current': float(row['motor_current']) if row['motor_current'] is not None else None,
+                })
+        
+        elif scale == '1d':
+            # 1 Day: hourly data
+            cursor.execute('''
+                SELECT hour_bucket, temp_avg, humidity_avg, pressure_avg, wind_avg,
+                       motor_power_avg, motor_voltage_avg, motor_current_avg
+                FROM hourly_agg
+                WHERE hour_bucket >= datetime('now', '-1 day')
+                ORDER BY hour_bucket ASC
+            ''')
+            rows = cursor.fetchall()
+            
+            result = []
+            for row in rows:
+                hour = int(row['hour_bucket'])
+                result.append({
+                    'timestamp': hour,
+                    'temperature': float(row['temp_avg']) if row['temp_avg'] is not None else None,
+                    'humidity': float(row['humidity_avg']) if row['humidity_avg'] is not None else None,
+                    'pressure': float(row['pressure_avg']) if row['pressure_avg'] is not None else None,
+                    'wind': float(row['wind_avg']) if row['wind_avg'] is not None else None,
+                    'power': float(row['motor_power_avg']) if row['motor_power_avg'] is not None else None,
+                    'voltage': float(row['motor_voltage_avg']) if row['motor_voltage_avg'] is not None else None,
+                    'current': float(row['motor_current_avg']) if row['motor_current_avg'] is not None else None,
+                })
+        
+        elif scale in ['1w', '1m']:
+            # 1 Week / 1 Month: daily data
+            days = 7 if scale == '1w' else 30
+            cursor.execute(f'''
+                SELECT day_date, temp_min, temp_max, temp_avg, humidity_min, humidity_max, humidity_avg,
+                       pressure_min, pressure_max, pressure_avg, wind_max, wind_avg, motor_power_avg
+                FROM daily_agg
+                WHERE day_date >= date('now', '-{days} days')
+                ORDER BY day_date ASC
+            ''')
+            rows = cursor.fetchall()
+            
+            result = []
+            for row in rows:
+                day_ts = int(datetime.strptime(row['day_date'], '%Y-%m-%d').timestamp())
+                result.append({
+                    'timestamp': day_ts,
+                    'date': row['day_date'],
+                    'temperature_min': float(row['temp_min']) if row['temp_min'] is not None else None,
+                    'temperature_max': float(row['temp_max']) if row['temp_max'] is not None else None,
+                    'temperature_avg': float(row['temp_avg']) if row['temp_avg'] is not None else None,
+                    'humidity_min': float(row['humidity_min']) if row['humidity_min'] is not None else None,
+                    'humidity_max': float(row['humidity_max']) if row['humidity_max'] is not None else None,
+                    'humidity_avg': float(row['humidity_avg']) if row['humidity_avg'] is not None else None,
+                    'pressure_min': float(row['pressure_min']) if row['pressure_min'] is not None else None,
+                    'pressure_max': float(row['pressure_max']) if row['pressure_max'] is not None else None,
+                    'pressure_avg': float(row['pressure_avg']) if row['pressure_avg'] is not None else None,
+                    'wind_max': float(row['wind_max']) if row['wind_max'] is not None else None,
+                    'wind_avg': float(row['wind_avg']) if row['wind_avg'] is not None else None,
+                    'power': float(row['motor_power_avg']) if row['motor_power_avg'] is not None else None,
+                    'voltage': float(row['motor_voltage_avg']) if row['motor_voltage_avg'] is not None else None,
+                    'current': float(row['motor_current_avg']) if row['motor_current_avg'] is not None else None,
+                })
+        
+        elif scale == '1y':
+            # 1 Year: weekly aggregation from daily data
+            cursor.execute('''
+                SELECT day_date, temp_min, temp_max, temp_avg, humidity_min, humidity_max, humidity_avg,
+                       pressure_min, pressure_max, pressure_avg, wind_max, wind_avg, motor_power_avg
+                FROM daily_agg
+                WHERE day_date >= date('now', '-365 days')
+                ORDER BY day_date ASC
+            ''')
+            rows = cursor.fetchall()
+            
+            # Resample to weekly
+            weekly = {}
+            for row in rows:
+                day_ts = datetime.strptime(row['day_date'], '%Y-%m-%d')
+                week_start = (day_ts - timedelta(days=day_ts.weekday())).date()
+                week_key = str(week_start)
+                
+                if week_key not in weekly:
+                    weekly[week_key] = {
+                        'temps': [], 'humidities': [], 'pressures': [],
+                        'winds': [], 'powers': [], 'voltages': [], 'currents': [], 'count': 0
+                    }
+                
+                if row['temperature_avg'] is not None:
+                    weekly[week_key]['temps'].append(row['temperature_avg'])
+                if row['humidity_avg'] is not None:
+                    weekly[week_key]['humidities'].append(row['humidity_avg'])
+                if row['pressure_avg'] is not None:
+                    weekly[week_key]['pressures'].append(row['pressure_avg'])
+                if row['wind_avg'] is not None:
+                    weekly[week_key]['winds'].append(row['wind_avg'])
+                if row['power'] is not None:
+                    weekly[week_key]['powers'].append(row['power'])
+                if row['voltage'] is not None:
+                    weekly[week_key]['voltages'].append(row['voltage'])
+                if row['current'] is not None:
+                    weekly[week_key]['currents'].append(row['current'])
+                weekly[week_key]['count'] += 1
+            
+            result = []
+            for week_str, data in sorted(weekly.items()):
+                week_ts = int(datetime.strptime(week_str, '%Y-%m-%d').timestamp())
+                result.append({
+                    'timestamp': week_ts,
+                    'week': week_str,
+                    'temperature_avg': sum(data['temps']) / len(data['temps']) if data['temps'] else None,
+                    'humidity_avg': sum(data['humidities']) / len(data['humidities']) if data['humidities'] else None,
+                    'pressure_avg': sum(data['pressures']) / len(data['pressures']) if data['pressures'] else None,
+                    'wind_avg': sum(data['winds']) / len(data['winds']) if data['winds'] else None,
+                    'power': sum(data['powers']) / len(data['powers']) if data['powers'] else None,
+                    'voltage': sum(data['voltages']) / len(data['voltages']) if data['voltages'] else None,
+                    'current': sum(data['currents']) / len(data['currents']) if data['currents'] else None,
+                })
+        
+        conn.close()
+        return jsonify({'scale': scale, 'data': result})
+    
+    except Exception as e:
+        print(f"[API] Graph error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ----------------------------------------------------------------------
 # WEB UI - ICONS
 # ----------------------------------------------------------------------
@@ -755,6 +1305,7 @@ ICONS = {
            '<path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>',
     "send": '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
     "trend": '<path d="m22 7-8.5 8.5-5-5L2 17"/><path d="M16 7h6v6"/>',
+    "cloud": '<path d="M22 16.92v.08a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-.5a2.5 2.5 0 0 1 2.29-2.5h1.4a2.5 2.5 0 0 0 2.36-3.75A3 3 0 0 1 20 10h2a2 2 0 0 1 2 2z"/>',
 }
 
 
@@ -1585,6 +2136,290 @@ async function sendMotor(on, resultId) {
 # WEB UI - PAGE SHELL
 # ----------------------------------------------------------------------
 
+NOTIF_CSS = r"""
+/* ===== Top-right: bell + clock ===== */
+.tb-right{display:flex;align-items:center;gap:12px}
+.tb-btn{position:relative;width:34px;height:34px;border-radius:10px;border:1px solid #e2e8f0;background:#fff;
+  color:#475569;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:.15s}
+.tb-btn:hover{background:#f8fafc;border-color:#cbd5e1;color:#0f172a}
+.tb-btn.open{background:#eff6ff;border-color:#93c5fd;color:#2563eb}
+.tb-badge{position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;
+  background:#ef4444;color:#fff;font-size:10.5px;font-weight:700;line-height:18px;text-align:center;
+  box-shadow:0 0 0 2px #fff}
+.tb-badge[hidden]{display:none}
+.tb-clock{font-size:12px;color:#475569;white-space:nowrap;font-variant-numeric:tabular-nums}
+.tb-bell.ringing svg{animation:bellRing 1s ease-in-out 3;transform-origin:50% 2px}
+@keyframes bellRing{0%,100%{transform:rotate(0)}10%{transform:rotate(16deg)}20%{transform:rotate(-14deg)}
+  30%{transform:rotate(12deg)}40%{transform:rotate(-10deg)}50%{transform:rotate(6deg)}60%{transform:rotate(-4deg)}70%{transform:rotate(0)}}
+.tb-bell.has-unread{color:#dc2626;border-color:#fecaca;background:#fef2f2}
+
+/* ===== Alarm panel ===== */
+.np{position:fixed;top:60px;right:16px;width:400px;max-width:calc(100vw - 24px);max-height:70vh;z-index:2000;
+  background:#fff;border:1px solid #e2e8f0;border-radius:14px;box-shadow:0 18px 40px rgba(15,23,42,.18);
+  display:flex;flex-direction:column;overflow:hidden;animation:npIn .15s ease-out;color:#0f172a}
+.np[hidden]{display:none}
+@keyframes npIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.np-head{display:flex;align-items:center;gap:10px;padding:14px 16px 10px}
+.np-ic{width:28px;height:28px;border-radius:8px;background:#fee2e2;color:#dc2626;display:inline-flex;
+  align-items:center;justify-content:center;flex-shrink:0}
+.np-title{font-size:15px;flex:1}
+.np-markall{border:1px solid #86efac;background:#f0fdf4;color:#15803d;font-size:11.5px;font-weight:600;
+  padding:4px 10px;border-radius:7px;cursor:pointer}
+.np-markall:hover{background:#dcfce7}
+.np-markall:disabled{opacity:.45;cursor:default}
+.np-close{border:0;background:none;font-size:22px;line-height:1;color:#94a3b8;cursor:pointer;padding:0 2px}
+.np-close:hover{color:#0f172a}
+.np-tabs{display:flex;gap:4px;padding:0 12px;border-bottom:1px solid #e2e8f0}
+.np-tab{border:0;background:none;padding:8px 10px;font-size:12.5px;color:#64748b;cursor:pointer;
+  border-bottom:2px solid transparent;margin-bottom:-1px}
+.np-tab.active{color:#2563eb;border-bottom-color:#2563eb;font-weight:600}
+.np-tab .n{display:inline-block;margin-left:4px;padding:0 6px;border-radius:8px;background:#fee2e2;
+  color:#dc2626;font-size:10px;font-weight:700}
+.np-list{overflow-y:auto;flex:1}
+.np-item{display:flex;gap:10px;padding:12px 16px;border-bottom:1px solid #f1f5f9;cursor:pointer;position:relative}
+.np-item:hover{background:#f8fafc}
+.np-item.unread{background:#fff7f7}
+.np-item.unread:hover{background:#fef2f2}
+.np-item-ic{width:30px;height:30px;border-radius:50%;background:#fee2e2;color:#dc2626;display:inline-flex;
+  align-items:center;justify-content:center;font-weight:800;flex-shrink:0;font-size:15px}
+.np-item.read .np-item-ic{background:#f1f5f9;color:#94a3b8}
+.np-item-body{flex:1;min-width:0}
+.np-item-top{display:flex;align-items:center;gap:8px}
+.np-item-top b{font-size:13px}
+.np-item.read .np-item-top b{font-weight:600;color:#475569}
+.np-tag{font-size:9.5px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:5px;
+  background:#dc2626;color:#fff}
+.np-item.read .np-tag{background:#e2e8f0;color:#64748b}
+.np-val{margin-left:auto;font-size:12px;font-weight:700;color:#dc2626;white-space:nowrap}
+.np-item.read .np-val{color:#64748b}
+.np-msg{margin:4px 0 4px;font-size:12px;line-height:1.45;color:#334155}
+.np-item.read .np-msg{color:#64748b}
+.np-time{font-size:11px;color:#94a3b8}
+.np-dot{position:absolute;left:6px;top:50%;width:6px;height:6px;margin-top:-3px;border-radius:50%;background:#ef4444}
+.np-empty{display:flex;flex-direction:column;align-items:center;gap:4px;padding:34px 16px 38px;text-align:center}
+.np-empty[hidden]{display:none}
+.np-check{font-size:34px;color:#16a34a;line-height:1;margin-bottom:6px}
+.np-empty b{font-size:14px}
+.np-empty span{font-size:12px;color:#64748b}
+.tb-bell.alarming{color:#fff;background:#dc2626;border-color:#dc2626;animation:bellPulse 1.2s ease-in-out infinite}
+.tb-bell.alarming svg{animation:bellRing 1s ease-in-out infinite;transform-origin:50% 2px}
+@keyframes bellPulse{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,.55)}50%{box-shadow:0 0 0 7px rgba(220,38,38,0)}}
+.tb-unlock{border:1px solid #fecaca;background:#fef2f2;color:#b91c1c;font-size:11.5px;font-weight:600;
+  padding:5px 10px;border-radius:8px;cursor:pointer;animation:bellPulse 1.2s ease-in-out infinite}
+.tb-unlock[hidden]{display:none}
+@media (max-width:640px){.tb-clock{display:none}.np{top:52px;right:8px}}
+"""
+
+NOTIF_JS = r"""
+(function () {
+    const $id = (id) => document.getElementById(id);
+    const bell = $id("notif-bell"), panel = $id("notif-panel");
+    if (!bell || !panel) return;
+
+    const store = {
+        get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+        set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+    };
+    let alerts = [], filter = "all";
+    let lastMax = parseInt(store.get("plc_alert_last_id", "-1"), 10);
+
+    const esc = (t) => String(t == null ? "" : t).replace(/[&<>"']/g,
+        (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+    const fmtDate = (ts) => new Date(ts * 1000).toLocaleString("en-GB", {
+        day: "numeric", month: "short", year: "numeric",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true});
+    function ago(ts) {
+        const s = Math.max(0, Date.now() / 1000 - ts);
+        if (s < 60) return "just now";
+        if (s < 3600) return Math.floor(s / 60) + " min ago";
+        if (s < 86400) return Math.floor(s / 3600) + " h ago";
+        return Math.floor(s / 86400) + " d ago";
+    }
+
+    /* ---- Alarm sound (plays in THIS browser, repeats while any alert is unread) ---- */
+    const ALARM_REPEAT_MS = 3000;
+    let actx = null, alarmTimer = null, unreadNow = 0;
+
+    function audio() {
+        if (!actx) {
+            const C = window.AudioContext || window.webkitAudioContext;
+            if (!C) return null;
+            actx = new C();
+        }
+        return actx;
+    }
+    function tone(a, freq, start, dur, vol) {
+        const o = a.createOscillator(), g = a.createGain(), t = a.currentTime + start;
+        o.type = "square";
+        o.frequency.setValueAtTime(freq, t);
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+        g.gain.setValueAtTime(vol, t + dur - 0.03);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        o.connect(g); g.connect(a.destination);
+        o.start(t); o.stop(t + dur + 0.02);
+    }
+    function beep(a) {
+        // 3 x "hi-lo" alarm pattern, ~1.1 s
+        for (let i = 0; i < 3; i++) {
+            tone(a, 988, i * 0.36, 0.16, 0.18);
+            tone(a, 784, i * 0.36 + 0.18, 0.16, 0.18);
+        }
+    }
+    function setBlocked(b) {
+        const u = $id("sound-unlock");
+        if (u) u.hidden = !b;
+    }
+    function playAlarm() {
+        const a = audio();
+        if (!a) return;
+        if (a.state === "running") {
+            setBlocked(false);
+            beep(a);
+        } else {
+            // Browser autoplay policy: sound needs one click/keypress on the page first
+            setBlocked(true);
+            a.resume().catch(() => {});
+        }
+    }
+    function syncAlarm(unread) {
+        unreadNow = unread;
+        bell.classList.toggle("alarming", unread > 0);
+        if (unread > 0 && !alarmTimer) {
+            playAlarm();
+            alarmTimer = setInterval(playAlarm, ALARM_REPEAT_MS);
+        } else if (unread === 0 && alarmTimer) {
+            clearInterval(alarmTimer);
+            alarmTimer = null;
+            setBlocked(false);
+        }
+    }
+    function unlockAudio() {
+        const a = audio();
+        if (!a) return;
+        const done = () => {
+            const u = $id("sound-unlock");
+            if (a.state === "running" && u && !u.hidden) {
+                setBlocked(false);
+                if (unreadNow > 0) beep(a);   // play right away, don't wait for next repeat
+            }
+        };
+        if (a.state === "running") done();
+        else a.resume().then(done).catch(() => {});
+    }
+    ["pointerdown", "keydown", "touchstart"].forEach((ev) =>
+        document.addEventListener(ev, unlockAudio, {capture: true, passive: true}));
+
+    function ring() {
+        bell.classList.remove("ringing");
+        void bell.offsetWidth;
+        bell.classList.add("ringing");
+    }
+
+    function render() {
+        const unread = alerts.filter((a) => !a.is_read).length;
+        const badge = $id("notif-count");
+        badge.textContent = unread > 99 ? "99+" : unread;
+        badge.hidden = unread === 0;
+        bell.classList.toggle("has-unread", unread > 0);
+        syncAlarm(unread);
+        $id("np-total").textContent = unread;
+        $id("mark-all-read").disabled = unread === 0;
+        panel.querySelectorAll(".np-tab").forEach((t) => {
+            const f = t.dataset.filter;
+            const label = f.charAt(0).toUpperCase() + f.slice(1);
+            t.innerHTML = label + (f === "unread" && unread ? '<span class="n">' + unread + "</span>" : "");
+        });
+
+        const list = alerts.filter((a) => filter === "all" || (filter === "unread" ? !a.is_read : a.is_read));
+        const empty = $id("notif-empty");
+        empty.hidden = list.length > 0;
+        if (!list.length) {
+            empty.querySelector("b").textContent = filter === "read" ? "Nothing here yet" : "All Clear";
+            empty.querySelector("span").textContent = filter === "read"
+                ? "Alerts you have read will stay listed here."
+                : "No active alarms or critical events detected.";
+        }
+        $id("notif-list").innerHTML = list.map((a) =>
+            '<div class="np-item ' + (a.is_read ? "read" : "unread") + '" data-id="' + a.id + '">' +
+            (a.is_read ? "" : '<span class="np-dot"></span>') +
+            '<span class="np-item-ic">!</span>' +
+            '<div class="np-item-body">' +
+            '<div class="np-item-top"><b>' + esc(a.title) + '</b><span class="np-tag">' + esc(String(a.level).toUpperCase()) + "</span>" +
+            (a.value != null ? '<span class="np-val">' + Number(a.value).toFixed(1) + " m/s</span>" : "") + "</div>" +
+            '<p class="np-msg">' + esc(a.message) + "</p>" +
+            '<span class="np-time">' + fmtDate(a.ts) + " &middot; " + ago(a.ts) + "</span>" +
+            "</div></div>").join("");
+    }
+
+    async function refresh() {
+        try {
+            const r = await fetch("/api/alerts", {cache: "no-store"});
+            if (!r.ok) return;
+            const d = await r.json();
+            alerts = d.alerts || [];
+            const maxId = alerts.length ? alerts[0].id : 0;
+            if (lastMax < 0) {
+                lastMax = maxId;                    // first visit: don't ring for old alerts
+                store.set("plc_alert_last_id", lastMax);
+            } else if (maxId > lastMax) {
+                lastMax = maxId;                    // brand-new alert arrived
+                store.set("plc_alert_last_id", lastMax);
+                ring();
+            }
+            render();
+        } catch (e) { /* server down: keep last list */ }
+    }
+
+    async function markRead(id) {
+        const a = alerts.find((x) => x.id === id);
+        if (!a || a.is_read) return;
+        a.is_read = 1;
+        render();
+        try { await fetch("/api/alerts/" + id + "/read", {method: "POST"}); } catch (e) {}
+    }
+
+    function openPanel(open) {
+        panel.hidden = !open;
+        bell.classList.toggle("open", open);
+        if (open) render();
+    }
+
+    bell.addEventListener("click", (e) => {
+        e.stopPropagation();
+        ring();
+        openPanel(panel.hidden);
+    });
+    $id("notif-close").addEventListener("click", () => openPanel(false));
+    $id("mark-all-read").addEventListener("click", async () => {
+        alerts.forEach((a) => { a.is_read = 1; });
+        render();
+        try { await fetch("/api/alerts/read_all", {method: "POST"}); } catch (e) {}
+    });
+    panel.querySelectorAll(".np-tab").forEach((t) => t.addEventListener("click", () => {
+        filter = t.dataset.filter;
+        panel.querySelectorAll(".np-tab").forEach((x) => x.classList.toggle("active", x === t));
+        render();
+    }));
+    $id("notif-list").addEventListener("click", (e) => {
+        const item = e.target.closest(".np-item");
+        if (item) markRead(parseInt(item.dataset.id, 10));
+    });
+    panel.addEventListener("click", (e) => e.stopPropagation());
+    document.addEventListener("click", () => { if (!panel.hidden) openPanel(false); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") openPanel(false); });
+
+    const clock = $id("tb-clock");
+    const tick = () => { if (clock) clock.textContent = new Date().toLocaleString("en-GB", {
+        day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+        second: "2-digit", hour12: true}); };
+    tick(); setInterval(tick, 1000);
+
+    refresh();
+    setInterval(refresh, 3000);
+})();
+"""
+
 BASE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1600,16 +2435,46 @@ BASE_HTML = """<!DOCTYPE html>
         <span class="brand-mark">{{ logo|safe }}</span>
         <span><span class="brand-name">PLC Monitor</span></span>
     </a>
-    <div class="conn" id="conn" role="status">
-        <span class="dot"></span><b id="conn-text">Connecting...</b>
-        <span class="conn-addr">{{ plc }}</span>
-        <span id="conn-time">--</span>
+    <div class="tb-right">
+        <button type="button" id="notif-bell" class="tb-btn tb-bell" title="Alarms &amp; Alerts" aria-label="Alarms and alerts">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+            <span class="tb-badge" id="notif-count" hidden>0</span>
+        </button>
+        <button type="button" id="sound-unlock" class="tb-unlock" hidden title="Your browser blocked the alarm sound until you interact with the page">
+            &#128263; Click to enable alarm sound
+        </button>
+        <span class="tb-clock" id="tb-clock">--</span>
+        <div class="conn" id="conn" role="status">
+            <span class="dot"></span><b id="conn-text">Connecting...</b>
+            <span class="conn-addr">{{ plc }}</span>
+            <span id="conn-time">--</span>
+        </div>
     </div>
 </header>
+<div class="np" id="notif-panel" hidden>
+    <div class="np-head">
+        <span class="np-ic"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg></span>
+        <b class="np-title">Alarms &amp; Alerts ( <span id="np-total">0</span> )</b>
+        <button type="button" class="np-markall" id="mark-all-read">&#10003; Mark All Read</button>
+        <button type="button" class="np-close" id="notif-close" aria-label="Close">&times;</button>
+    </div>
+    <div class="np-tabs">
+        <button type="button" class="np-tab active" data-filter="all">All</button>
+        <button type="button" class="np-tab" data-filter="unread">Unread</button>
+        <button type="button" class="np-tab" data-filter="read">Read</button>
+    </div>
+    <div class="np-list" id="notif-list"></div>
+    <div class="np-empty" id="notif-empty">
+        <div class="np-check">&#10003;</div>
+        <b>All Clear</b>
+        <span>No active alarms or critical events detected.</span>
+    </div>
+</div>
 <nav class="tabs">{{ nav|safe }}</nav>
 <main>{{ body|safe }}</main>
 <script>const LIMITS = {{ limits|safe }};</script>
 <script>{{ widgets_js|safe }}</script>
+<script>{{ notif_js|safe }}</script>
 {{ script|safe }}
 </body>
 </html>
@@ -1642,6 +2507,7 @@ def render_page(title, active, body, script=""):
                 TRANSPARENT_LIGHT_TEXT_CSS if TRANSPARENT_TEXT == "light" else "")
     elif active in WHITE_BG_PAGES:
         css += WHITE_PAGE_CSS
+    css += NOTIF_CSS
 
     return render_template_string(
         BASE_HTML,
@@ -1654,6 +2520,7 @@ def render_page(title, active, body, script=""):
         body=body,
         limits=json.dumps(limits),
         widgets_js=WIDGETS_JS,
+        notif_js=NOTIF_JS,
         script=script,
     )
 
@@ -1735,6 +2602,96 @@ WIND_MAX = UI_LIMITS["wind"]["max"]
 
 @app.get("/")
 def home_page():
+    # Time-scale graphs widget
+    graph_widget_html = f"""
+    <style>
+    .time-scale {{display: flex; gap: 0.5rem; margin: 1rem 0;}}
+    .time-scale button {{padding: 0.5rem 1rem; border: 1px solid #cbd5e1; background: #f1f5f9; border-radius: 6px;
+                        cursor: pointer; font-size: 0.875rem; font-weight: 600; color: #1e293b; transition: all 0.2s;}}
+    .time-scale button:hover {{background: #e2e8f0;}}
+    .time-scale button.active {{background: #2563eb; color: white; border-color: #2563eb;}}
+    .graph-container {{position: relative; height: 280px; margin-top: 1rem;}}
+
+    </style>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    
+    <script>
+    let charts = {{}};
+    
+    function loadGraph(scale, metric) {{
+        fetch('/api/graph/' + scale + '?metric=' + metric, {{cache: 'no-store'}})
+            .then(r => r.json())
+            .then(res => drawChart(scale, metric, res.data))
+            .catch(e => console.error('Graph load error:', e));
+        
+        document.querySelectorAll('#gs-' + metric + ' .time-scale button').forEach(b => 
+            b.classList.remove('active'));
+        event.target.classList.add('active');
+    }}
+    
+    function drawChart(scale, metric, data) {{
+        const cid = 'canvas-' + metric;
+        const ctx = document.getElementById(cid);
+        if (!ctx) return;
+        
+        const labels = data.map(d => {{
+            const dt = new Date(d.timestamp * 1000);
+            if (scale === '1d') return dt.toLocaleTimeString('en-US', {{hour: '2-digit', minute: '2-digit'}});
+            return d.date || d.week;
+        }});
+        
+        let values;
+        if (metric === 'temperature') {{
+            values = data.map(d => d.temperature !== undefined ? d.temperature : d.temperature_avg || 0);
+        }} else if (metric === 'humidity') {{
+            values = data.map(d => d.humidity !== undefined ? d.humidity : d.humidity_avg || 0);
+        }} else if (metric === 'power') {{
+            values = data.map(d => d.power || 0);
+        }}
+        
+        if (charts[cid]) charts[cid].destroy();
+        
+        const colors = {{temperature: '#f59e0b', humidity: '#0891b2', power: '#7c3aed'}};
+        const color = colors[metric] || '#2563eb';
+        
+        charts[cid] = new Chart(ctx, {{
+            type: 'line',
+            data: {{
+                labels: labels,
+                datasets: [{{
+                    label: metric.charAt(0).toUpperCase() + metric.slice(1),
+                    data: values,
+                    borderColor: color,
+                    backgroundColor: color + '20',
+                    tension: 0.4,
+                    fill: true,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{legend: {{display: false}}}},
+                scales: {{
+                    y: {{beginAtZero: false, grid: {{color: '#f1f5f9'}}}},
+                    x: {{grid: {{color: '#f1f5f9'}}}}
+                }}
+            }}
+        }});
+    }}
+    
+    // Load initial graphs
+    window.addEventListener('DOMContentLoaded', () => {{
+        ['temperature', 'humidity', 'power'].forEach(m => {{
+            loadGraph('1d', m);
+        }});
+    }});
+    </script>
+    """
+    
     wind_body = gauge_body("ov-wind", "m/s")
 
     env_body = (
@@ -1800,16 +2757,378 @@ def home_page():
         + trend_widget("Power Trend", "Watts over the rolling window", "ov-pw-trend", "violet")
         + trend_widget("Current Trend", "Amps over the rolling window", "ov-cu-trend", "red")
         + "</div>"
-        + f'<div class="section-h"><span class="ic">{icon("trend")}</span>Environment Trends</div>'
-        + '<div class="widgets cols-3">'
-        + trend_widget("Temperature Trend", "°C over the rolling window", "ov-t-trend", "amber")
-        + trend_widget("Humidity Trend", "%RH over the rolling window", "ov-h-trend", "cyan")
-        + trend_widget("Pressure Trend", "hPa over the rolling window", "ov-p-trend", "violet")
+        + f'<div class="section-h"><span class="ic">{icon("trend")}</span>Time-Scale Graphs (Historical Data)</div>'
+        + '<div class="widgets" style="grid-template-columns: 1fr;">'
+        # ROW 1: Temperature + Humidity (MERGED, dual Y-axis)
+        + widget("Temperature & Humidity", "1H/1D/1W/1M/1Y - °C / %RH", "thermometer",
+                 '<div id="gs-temp-humid" class="time-scale" style="display:flex;justify-content:flex-end;gap:6px;margin-bottom:8px;">'
+                 '<button onclick="loadMergedGraph(\'1h\', \'temp-humid\')" class="active">1H</button>'
+                 '<button onclick="loadMergedGraph(\'1d\', \'temp-humid\')">1D</button>'
+                 '<button onclick="loadMergedGraph(\'1w\', \'temp-humid\')">1W</button>'
+                 '<button onclick="loadMergedGraph(\'1m\', \'temp-humid\')">1M</button>'
+                 '<button onclick="loadMergedGraph(\'1y\', \'temp-humid\')">1Y</button>'
+                 '</div><div class="graph-container"><canvas id="canvas-temp-humid"></canvas></div>',
+                 "Needs 1h data", "Hourly avg", icon_tone="amber", body_cls="left")
+        # ROW 2: Voltage + Current (MERGED, dual Y-axis)
+        + widget("Voltage & Current", "1H/1D/1W/1M/1Y - V / A", "zap",
+                 '<div id="gs-volt-curr" class="time-scale" style="display:flex;justify-content:flex-end;gap:6px;margin-bottom:8px;">'
+                 '<button onclick="loadMergedGraph(\'1h\', \'volt-curr\')" class="active">1H</button>'
+                 '<button onclick="loadMergedGraph(\'1d\', \'volt-curr\')">1D</button>'
+                 '<button onclick="loadMergedGraph(\'1w\', \'volt-curr\')">1W</button>'
+                 '<button onclick="loadMergedGraph(\'1m\', \'volt-curr\')">1M</button>'
+                 '<button onclick="loadMergedGraph(\'1y\', \'volt-curr\')">1Y</button>'
+                 '</div><div class="graph-container"><canvas id="canvas-volt-curr"></canvas></div>',
+                 "Needs 1h data", "Hourly avg", icon_tone="amber", body_cls="left")
+        + "</div>"
+        + '<div class="widgets hist-pair" style="grid-template-columns: 1fr 1fr; gap: 16px;">'
+        # ROW 3: Pump Power (SINGLE)
+        + widget("Pump Power", "1H/1D/1W/1M/1Y - W", "gauge",
+                 '<div id="gs-power" class="time-scale" style="display:flex;justify-content:flex-end;gap:6px;margin-bottom:8px;">'
+                 '<button onclick="loadGraph(\'1h\', \'power\')" class="active">1H</button>'
+                 '<button onclick="loadGraph(\'1d\', \'power\')">1D</button>'
+                 '<button onclick="loadGraph(\'1w\', \'power\')">1W</button>'
+                 '<button onclick="loadGraph(\'1m\', \'power\')">1M</button>'
+                 '<button onclick="loadGraph(\'1y\', \'power\')">1Y</button>'
+                 '</div><div class="graph-container"><canvas id="canvas-power"></canvas></div>',
+                 "Needs 1h data", "Hourly avg", icon_tone="violet", body_cls="left")
+        # ROW 4: Pressure (SINGLE)
+        + widget("Pressure", "1H/1D/1W/1M/1Y - hPa", "cloud",
+                 '<div id="gs-pressure" class="time-scale" style="display:flex;justify-content:flex-end;gap:6px;margin-bottom:8px;">'
+                 '<button onclick="loadGraph(\'1h\', \'pressure\')" class="active">1H</button>'
+                 '<button onclick="loadGraph(\'1d\', \'pressure\')">1D</button>'
+                 '<button onclick="loadGraph(\'1w\', \'pressure\')">1W</button>'
+                 '<button onclick="loadGraph(\'1m\', \'pressure\')">1M</button>'
+                 '<button onclick="loadGraph(\'1y\', \'pressure\')">1Y</button>'
+                 '</div><div class="graph-container"><canvas id="canvas-pressure"></canvas></div>',
+                 "Needs 1h data", "Hourly avg", icon_tone="purple", body_cls="left")
         + "</div>"
     )
 
     script = r"""
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <script>
+    let charts = {};
+    
+    function loadGraph(scale, metric) {
+        const btn = event.target;
+        btn.disabled = true;
+        
+        fetch('/api/graph/' + scale + '?metric=' + metric, {cache: 'no-store'})
+            .then(r => r.json())
+            .then(res => {
+                const cid = 'canvas-' + metric;
+                const canvas = document.getElementById(cid);
+                const container = canvas ? canvas.parentElement : null;
+                
+                if (!res.data || res.data.length === 0) {
+                    if (container) {
+                        container.innerHTML = '<div id="' + cid + '" style="display:none;"></div><div style="padding: 20px; text-align: center; color: #94a3b8;">No data yet. Waiting for ' + scale + ' data...</div>';
+                    }
+                } else {
+                    if (container) {
+                        container.innerHTML = '<canvas id="' + cid + '"></canvas>';
+                    }
+                    drawChart(scale, metric, res.data);
+                }
+            })
+            .catch(e => {
+                console.error('Graph error:', e);
+                const cid = 'canvas-' + metric;
+                const canvas = document.getElementById(cid);
+                const container = canvas ? canvas.parentElement : null;
+                if (container) {
+                    container.innerHTML = '<div id="' + cid + '" style="display:none;"></div><div style="padding: 20px; text-align: center; color: #ef4444;">Error loading graph</div>';
+                }
+            })
+            .finally(() => { btn.disabled = false; });
+        
+        document.querySelectorAll('#gs-' + metric + ' button').forEach(b => 
+            b.classList.remove('active'));
+        btn.classList.add('active');
+    }
+    
+    function loadMergedGraph(scale, mergeType) {
+        const btn = event.target;
+        btn.disabled = true;
+        const gsId = 'gs-' + mergeType;
+        
+        fetch('/api/graph/' + scale + '?metric=' + (mergeType === 'temp-humid' ? 'temperature' : 'voltage'), {cache: 'no-store'})
+            .then(r => r.json())
+            .then(res => {
+                const cid = 'canvas-' + mergeType;
+                const canvas = document.getElementById(cid);
+                const container = canvas ? canvas.parentElement : null;
+                
+                if (!res.data || res.data.length === 0) {
+                    if (container) {
+                        container.innerHTML = '<div id="' + cid + '" style="display:none;"></div><div style="padding: 20px; text-align: center; color: #94a3b8;">No data yet. Waiting for ' + scale + ' data...</div>';
+                    }
+                } else {
+                    if (container) {
+                        container.innerHTML = '<canvas id="' + cid + '"></canvas>';
+                    }
+                    drawMergedChart(scale, mergeType, res.data);
+                }
+            })
+            .catch(e => {
+                console.error('Graph error:', e);
+                const cid = 'canvas-' + mergeType;
+                const canvas = document.getElementById(cid);
+                const container = canvas ? canvas.parentElement : null;
+                if (container) {
+                    container.innerHTML = '<div id="' + cid + '" style="display:none;"></div><div style="padding: 20px; text-align: center; color: #ef4444;">Error loading graph</div>';
+                }
+            })
+            .finally(() => { btn.disabled = false; });
+        
+        document.querySelectorAll('#' + gsId + ' button').forEach(b => 
+            b.classList.remove('active'));
+        btn.classList.add('active');
+    }
+    
+    /* ===== Historical graphs: trend-card style + built-in wheel zoom ===== */
+    (function () {
+        const st = document.createElement('style');
+        st.textContent =
+            '.graph-container{position:relative;height:260px;margin-top:4px;cursor:grab;}' +
+            '.graph-container.dragging{cursor:grabbing;}' +
+            '.hist-hint{position:absolute;left:8px;bottom:2px;font-size:10px;color:#94a3b8;pointer-events:none;}' +
+            '.widgets.hist-pair .graph-container{height:220px;}';
+        document.head.appendChild(st);
+    })();
+
+    const HIST = {};             // cid -> {ts, series, start, end, scale}
+    const HIST_MAX_POINTS = 150;  // same density as the trend cards
+
+    function hexA(hex, a) {
+        const h = hex.replace('#', '');
+        const r = parseInt(h.substr(0, 2), 16), g = parseInt(h.substr(2, 2), 16), b = parseInt(h.substr(4, 2), 16);
+        return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+    }
+
+    function gradientFill(color) {
+        return function (context) {
+            const chart = context.chart, area = chart.chartArea;
+            if (!area) return 'transparent';
+            const g = chart.ctx.createLinearGradient(0, area.top, 0, area.bottom);
+            g.addColorStop(0, hexA(color, 0.25));
+            g.addColorStop(1, hexA(color, 0));
+            return g;
+        };
+    }
+
+    function fmtTime(ts, spanSec) {
+        const dt = new Date(ts * 1000);
+        if (spanSec <= 2 * 86400) {
+            return dt.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', hour12: true});
+        }
+        return dt.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+    }
+
+    // Average raw points into at most maxPts buckets (smooth curve like the trend cards)
+    function bucketAvg(ts, arrs, s, e, maxPts) {
+        const n = e - s, step = Math.max(1, Math.ceil(n / maxPts));
+        const outT = [], outA = arrs.map(() => []);
+        for (let i = s; i < e; i += step) {
+            const j = Math.min(e, i + step);
+            outT.push(ts[Math.floor((i + j - 1) / 2)]);
+            arrs.forEach((a, k) => {
+                let sum = 0, c = 0;
+                for (let q = i; q < j; q++) {
+                    const v = a[q];
+                    if (v !== null && !isNaN(v)) { sum += v; c++; }
+                }
+                outA[k].push(c ? sum / c : null);
+            });
+        }
+        return {t: outT, a: outA};
+    }
+
+    // Y-axis hugs min/max with 15% padding, exactly like Trend.draw()
+    function fitRange(vals) {
+        const v = vals.filter(x => x !== null && !isNaN(x));
+        if (!v.length) return {min: 0, max: 1};
+        let lo = Math.min(...v), hi = Math.max(...v);
+        if (hi - lo < 1e-9) { hi += 1; lo -= 1; }
+        const pad = (hi - lo) * 0.15;
+        return {min: lo - pad, max: hi + pad};
+    }
+
+    function tickFmt(v) {
+        const a = Math.abs(v);
+        return a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2);
+    }
+
+    function renderHist(cid) {
+        const H = HIST[cid], chart = charts[cid];
+        if (!H || !chart) return;
+        const s = H.start, e = H.end;
+        const span = H.ts[e - 1] - H.ts[s];
+        const {t, a} = bucketAvg(H.ts, H.series, s, e, HIST_MAX_POINTS);
+        chart.data.labels = t.map(x => fmtTime(x, span));
+        chart.data.datasets.forEach((ds, k) => {
+            ds.data = a[k];
+            const r = fitRange(a[k]);
+            const ax = chart.options.scales[ds.yAxisID];
+            ax.min = r.min; ax.max = r.max;
+        });
+        chart.update('none');
+        const hint = document.getElementById(cid + '-hint');
+        if (hint) {
+            const zoomed = (e - s) < H.ts.length;
+            hint.textContent = zoomed ? 'Zoomed · double-click to reset' : 'Scroll to zoom · drag to pan';
+        }
+    }
+
+    function bindZoom(cid) {
+        const canvas = document.getElementById(cid);
+        if (!canvas || canvas._histBound) return;
+        canvas._histBound = true;
+        const box = canvas.parentElement;
+        if (box && !document.getElementById(cid + '-hint')) {
+            const h = document.createElement('div');
+            h.id = cid + '-hint'; h.className = 'hist-hint';
+            box.appendChild(h);
+        }
+
+        canvas.addEventListener('wheel', ev => {
+            const H = HIST[cid], chart = charts[cid];
+            if (!H || !chart || !chart.chartArea) return;
+            ev.preventDefault();
+            const area = chart.chartArea, total = H.ts.length;
+            const len = H.end - H.start;
+            const frac = Math.min(1, Math.max(0, (ev.offsetX - area.left) / (area.right - area.left)));
+            const anchor = H.start + frac * len;
+            const factor = ev.deltaY < 0 ? 0.75 : 1.33;
+            let newLen = Math.round(len * factor);
+            newLen = Math.max(Math.min(20, total), Math.min(total, newLen));
+            let ns = Math.round(anchor - frac * newLen);
+            ns = Math.max(0, Math.min(total - newLen, ns));
+            H.start = ns; H.end = ns + newLen;
+            renderHist(cid);
+        }, {passive: false});
+
+        let drag = null;
+        canvas.addEventListener('mousedown', ev => {
+            const H = HIST[cid];
+            if (!H) return;
+            drag = {x: ev.clientX, s: H.start, e: H.end};
+            box && box.classList.add('dragging');
+        });
+        window.addEventListener('mousemove', ev => {
+            if (!drag) return;
+            const H = HIST[cid], chart = charts[cid];
+            if (!H || !chart || !chart.chartArea) return;
+            const w = chart.chartArea.right - chart.chartArea.left;
+            const len = drag.e - drag.s, total = H.ts.length;
+            let shift = Math.round(-(ev.clientX - drag.x) / w * len);
+            let ns = Math.max(0, Math.min(total - len, drag.s + shift));
+            if (ns !== H.start) { H.start = ns; H.end = ns + len; renderHist(cid); }
+        });
+        window.addEventListener('mouseup', () => {
+            drag = null;
+            box && box.classList.remove('dragging');
+        });
+        canvas.addEventListener('dblclick', () => {
+            const H = HIST[cid];
+            if (!H) return;
+            H.start = 0; H.end = H.ts.length;
+            renderHist(cid);
+        });
+    }
+
+    function yAxis(color, position, title, showGrid) {
+        return {
+            type: 'linear', display: true, position: position,
+            grid: showGrid ? {color: 'rgba(148,163,184,0.18)', drawBorder: false, borderDash: [3, 3]}
+                           : {drawOnChartArea: false, drawBorder: false},
+            ticks: {font: {size: 10}, color: color, maxTicksLimit: 5, callback: tickFmt},
+            title: {display: !!title, text: title, font: {size: 10}, color: color}
+        };
+    }
+
+    function trendDataset(label, color, axisId) {
+        return {
+            label: label, data: [], yAxisID: axisId,
+            borderColor: color, backgroundColor: gradientFill(color),
+            fill: 'start', tension: 0.35, borderWidth: 2,
+            pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 8,
+            pointBackgroundColor: color, pointBorderColor: '#fff', spanGaps: true
+        };
+    }
+
+    function buildHistChart(cid, scale, data, defs) {
+        const canvas = document.getElementById(cid);
+        if (!canvas || canvas.tagName !== 'CANVAS') return;
+        if (charts[cid]) charts[cid].destroy();
+
+        const rows = data.slice().sort((p, q) => p.timestamp - q.timestamp);
+        HIST[cid] = {
+            ts: rows.map(d => d.timestamp),
+            series: defs.map(df => rows.map(df.get)),
+            start: 0, end: rows.length, scale: scale
+        };
+
+        const scales = {
+            x: {
+                grid: {display: false, drawBorder: false},
+                ticks: {font: {size: 10}, color: '#64748b', maxTicksLimit: 6, maxRotation: 0, autoSkip: true}
+            }
+        };
+        defs.forEach((df, k) => {
+            scales[df.axis] = yAxis(df.color, k === 0 ? 'left' : 'right', defs.length > 1 ? df.label : '', k === 0);
+        });
+
+        charts[cid] = new Chart(canvas, {
+            type: 'line',
+            data: {labels: [], datasets: defs.map(df => trendDataset(df.label, df.color, df.axis))},
+            options: {
+                responsive: true, maintainAspectRatio: false, animation: false,
+                interaction: {mode: 'index', intersect: false},
+                plugins: {
+                    legend: {display: defs.length > 1, position: 'top', align: 'end',
+                             labels: {font: {size: 11}, boxWidth: 10, boxHeight: 10, usePointStyle: true}},
+                    tooltip: {
+                        backgroundColor: 'rgba(15,23,42,0.85)', padding: 10,
+                        callbacks: {
+                            label: c => ' ' + c.dataset.label + ': ' +
+                                (c.parsed.y === null ? '--' : c.parsed.y.toFixed(2)) + ' ' + defs[c.datasetIndex].unit
+                        }
+                    }
+                },
+                scales: scales
+            }
+        });
+        bindZoom(cid);
+        renderHist(cid);
+    }
+
+    const num0 = v => { const x = parseFloat(v); return isNaN(x) ? null : x; };
+
+
+    const METRIC_DEFS = {
+        temperature: {label: 'Temperature', unit: '°C',  color: '#f59e0b', get: d => num0(d.temperature ?? d.temperature_avg)},
+        humidity:    {label: 'Humidity',    unit: '%RH', color: '#0891b2', get: d => num0(d.humidity ?? d.humidity_avg)},
+        pressure:    {label: 'Pressure',    unit: 'hPa', color: '#8b5cf6', get: d => num0(d.pressure ?? d.pressure_avg)},
+        power:       {label: 'Pump Power',  unit: 'W',   color: '#7c3aed', get: d => num0(d.power ?? d.motor_power_avg)},
+        voltage:     {label: 'Voltage',     unit: 'V',   color: '#eab308', get: d => num0(d.voltage ?? d.motor_voltage_avg)},
+        current:     {label: 'Current',     unit: 'A',   color: '#ef4444', get: d => num0(d.current ?? d.motor_current_avg)}
+    };
+
+    function drawChart(scale, metric, data) {
+        const m = METRIC_DEFS[metric];
+        if (!m) return;
+        buildHistChart('canvas-' + metric, scale, data, [Object.assign({axis: 'y'}, m)]);
+    }
+
+    function drawMergedChart(scale, mergeType, data) {
+        const pair = mergeType === 'temp-humid' ? ['temperature', 'humidity'] : ['voltage', 'current'];
+        buildHistChart('canvas-' + mergeType, scale, data, [
+            Object.assign({axis: 'y'},  METRIC_DEFS[pair[0]]),
+            Object.assign({axis: 'y1'}, METRIC_DEFS[pair[1]])
+        ]);
+    }
+
     Gauge.mount("ov-wind-g", {min: 0, max: LIMITS.wind.max, zones: Z.wind(), ticks: T.wind(), decimals: 1});
     Thermo.mount("ov-thermo");
     Ring.mount("ov-hum-ring", {label: "% RH"});
@@ -1872,6 +3191,7 @@ def home_page():
         setTile("volt", vs);
         setTile("curr", cs);
 
+
         /* pump activity */
         setText("ov-down", fmt(d.motor_downtime_min, 1));
         setText("ov-down-sub", fmtDuration(d.motor_downtime_min));
@@ -1896,16 +3216,48 @@ def home_page():
         setTile("total", tot === null ? ["idle", "No data"] : ["ok", (tot / 60).toFixed(2) + " h"]);
         const idle = num(d.motor_total_idle_min);
         setTile("idle", idle === null ? ["idle", "No data"] : ["warn", (idle / 60).toFixed(2) + " h"]);
-
-        /* environment trends */
-        Trend.draw("ov-t-trend", series(h, "temperature"), {color: "#f59e0b", decimals: 1, unit: "°"});
-        Trend.draw("ov-h-trend", series(h, "humidity"), {color: "#0891b2", decimals: 1, unit: "%"});
-        Trend.draw("ov-p-trend", series(h, "pressure"), {color: "#7c3aed", decimals: 1, unit: ""});
-        ["ov-t-trend", "ov-h-trend", "ov-p-trend"].forEach((id) => {
-            setText(id + "-win", windowLabel(h.length));
-            setText(id + "-n", h.length);
-        });
     }
+    
+    // Load initial graphs
+    setTimeout(() => {
+        // Load merged graphs
+        ['temp-humid', 'volt-curr'].forEach(mergeType => {
+            const btn = document.querySelector('#gs-' + mergeType + ' button.active');
+            if (btn) {
+                const metric = mergeType === 'temp-humid' ? 'temperature' : 'voltage';
+                fetch('/api/graph/1h?metric=' + metric, {cache: 'no-store'})
+                    .then(r => r.json())
+                    .then(res => {
+                        console.log('Graph data for ' + mergeType + ': ' + res.data.length + ' points');
+                        if (res.data && res.data.length > 0) {
+                            drawMergedChart('1h', mergeType, res.data);
+                        } else {
+                            console.warn('No data for ' + mergeType);
+                        }
+                    })
+                    .catch(e => console.error('Initial load error for ' + mergeType + ':', e));
+            }
+        });
+        
+        // Load single graphs
+        ['pressure', 'power'].forEach(m => {
+            const btn = document.querySelector('#gs-' + m + ' button.active');
+            if (btn) {
+                fetch('/api/graph/1h?metric=' + m, {cache: 'no-store'})
+                    .then(r => r.json())
+                    .then(res => {
+                        console.log('Graph data for ' + m + ': ' + res.data.length + ' points');
+                        if (res.data && res.data.length > 0) {
+                            drawChart('1h', m, res.data);
+                        } else {
+                            console.warn('No data for ' + m);
+                        }
+                    })
+                    .catch(e => console.error('Initial load error for ' + m + ':', e));
+            }
+        });
+    }, 1000);
+    
     startLoop(refresh);
     </script>
     """
@@ -2099,6 +3451,8 @@ def pump_page():
 # ----------------------------------------------------------------------
 
 if __name__ == "__main__":
+    init_db()
+    
     polling_thread = threading.Thread(target=plc_polling_loop, daemon=True)
     polling_thread.start()
 
