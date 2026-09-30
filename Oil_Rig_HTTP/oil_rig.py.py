@@ -43,6 +43,7 @@ Then open:
 """
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -50,14 +51,14 @@ import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from pymodbus.client import ModbusTcpClient
 
 # ----------------------------------------------------------------------
 # PLC / USR-W630 SETTINGS
 # ----------------------------------------------------------------------
 
-PLC_IP = "10.10.100.254"
+PLC_IP = "10.10.12.76"
 PLC_PORT = 8899
 PLC_SLAVE_ID = 1
 
@@ -95,6 +96,9 @@ WHITE_BG_PAGES = {"overview"}
 
 # SQLite Database
 DB_PATH = "plc_data.db"
+
+# Alarm audio file. Expected path: <project>/audio/audio_alert.mp3
+AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
 
 # Wind alarm: one CRITICAL alert per pump run when wind >= this value (m/s).
 # The next alert can only fire after the pump is switched OFF and ON again.
@@ -1009,6 +1013,12 @@ def snapshot(keys=None):
 # ----------------------------------------------------------------------
 # HTTP API
 # ----------------------------------------------------------------------
+
+@app.get("/audio/audio_alert.mp3")
+def alarm_audio_file():
+    """Serve the alarm MP3 stored in the local audio folder."""
+    return send_from_directory(AUDIO_DIR, "audio_alert.mp3")
+
 
 @app.get("/api/all")
 def api_all():
@@ -2236,77 +2246,85 @@ NOTIF_JS = r"""
         return Math.floor(s / 86400) + " d ago";
     }
 
-    /* ---- Alarm sound (plays in THIS browser, repeats while any alert is unread) ---- */
-    const ALARM_REPEAT_MS = 3000;
-    let actx = null, alarmTimer = null, unreadNow = 0;
+    /* ---- Anemometer alarm MP3 only; no generated beeper/tone sound ---- */
+    const ALARM_GAP_MS = 5000;  // 5-second silent break AFTER the MP3 finishes
+    const alarmAudio = new Audio("/audio/audio_alert.mp3");
+    alarmAudio.preload = "auto";
+    let alarmTimer = null, unreadAnemometerNow = 0;
 
-    function audio() {
-        if (!actx) {
-            const C = window.AudioContext || window.webkitAudioContext;
-            if (!C) return null;
-            actx = new C();
-        }
-        return actx;
+    function isAnemometerAlarm(a) {
+        return a && !a.is_read && a.title === "Critical Wind Speed";
     }
-    function tone(a, freq, start, dur, vol) {
-        const o = a.createOscillator(), g = a.createGain(), t = a.currentTime + start;
-        o.type = "square";
-        o.frequency.setValueAtTime(freq, t);
-        g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
-        g.gain.setValueAtTime(vol, t + dur - 0.03);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-        o.connect(g); g.connect(a.destination);
-        o.start(t); o.stop(t + dur + 0.02);
-    }
-    function beep(a) {
-        // 3 x "hi-lo" alarm pattern, ~1.1 s
-        for (let i = 0; i < 3; i++) {
-            tone(a, 988, i * 0.36, 0.16, 0.18);
-            tone(a, 784, i * 0.36 + 0.18, 0.16, 0.18);
-        }
-    }
+
     function setBlocked(b) {
         const u = $id("sound-unlock");
         if (u) u.hidden = !b;
     }
-    function playAlarm() {
-        const a = audio();
-        if (!a) return;
-        if (a.state === "running") {
-            setBlocked(false);
-            beep(a);
-        } else {
-            // Browser autoplay policy: sound needs one click/keypress on the page first
-            setBlocked(true);
-            a.resume().catch(() => {});
-        }
+
+    function stopAlarmAudio() {
+        alarmAudio.pause();
+        try { alarmAudio.currentTime = 0; } catch (e) {}
     }
-    function syncAlarm(unread) {
-        unreadNow = unread;
-        bell.classList.toggle("alarming", unread > 0);
-        if (unread > 0 && !alarmTimer) {
-            playAlarm();
-            alarmTimer = setInterval(playAlarm, ALARM_REPEAT_MS);
-        } else if (unread === 0 && alarmTimer) {
-            clearInterval(alarmTimer);
+
+    function scheduleNextAlarm() {
+        if (alarmTimer) {
+            clearTimeout(alarmTimer);
             alarmTimer = null;
+        }
+
+        if (unreadAnemometerNow <= 0) return;
+
+        alarmTimer = setTimeout(() => {
+            alarmTimer = null;
+            playAlarm();
+        }, ALARM_GAP_MS);
+    }
+
+    function playAlarm() {
+        if (unreadAnemometerNow <= 0) return;
+
+        // Always let the MP3 play from the beginning to the end.
+        stopAlarmAudio();
+
+        const p = alarmAudio.play();
+        if (p && typeof p.then === "function") {
+            p.then(() => setBlocked(false)).catch(() => {
+                // Browser autoplay policy: one click/keypress may be required first.
+                setBlocked(true);
+            });
+        } else {
             setBlocked(false);
         }
     }
-    function unlockAudio() {
-        const a = audio();
-        if (!a) return;
-        const done = () => {
-            const u = $id("sound-unlock");
-            if (a.state === "running" && u && !u.hidden) {
-                setBlocked(false);
-                if (unreadNow > 0) beep(a);   // play right away, don't wait for next repeat
+
+    // When the 6-second MP3 ends, wait 5 seconds before playing it again.
+    alarmAudio.addEventListener("ended", () => {
+        if (unreadAnemometerNow > 0) scheduleNextAlarm();
+    });
+
+    function syncAlarm(unreadAnemometer) {
+        const wasActive = unreadAnemometerNow > 0;
+        unreadAnemometerNow = unreadAnemometer;
+        bell.classList.toggle("alarming", unreadAnemometer > 0);
+
+        if (unreadAnemometer > 0 && !wasActive && alarmAudio.paused && !alarmTimer) {
+            // First unread anemometer alarm: play immediately.
+            playAlarm();
+        } else if (unreadAnemometer === 0) {
+            if (alarmTimer) {
+                clearTimeout(alarmTimer);
+                alarmTimer = null;
             }
-        };
-        if (a.state === "running") done();
-        else a.resume().then(done).catch(() => {});
+            stopAlarmAudio();
+            setBlocked(false);
+        }
     }
+
+    function unlockAudio() {
+        // A user interaction allows browsers to enable media playback.
+        if (unreadAnemometerNow > 0) playAlarm();
+    }
+
     ["pointerdown", "keydown", "touchstart"].forEach((ev) =>
         document.addEventListener(ev, unlockAudio, {capture: true, passive: true}));
 
@@ -2318,11 +2336,13 @@ NOTIF_JS = r"""
 
     function render() {
         const unread = alerts.filter((a) => !a.is_read).length;
+        const unreadAnemometer = alerts.filter(isAnemometerAlarm).length;
         const badge = $id("notif-count");
         badge.textContent = unread > 99 ? "99+" : unread;
         badge.hidden = unread === 0;
         bell.classList.toggle("has-unread", unread > 0);
-        syncAlarm(unread);
+        // Audio is ONLY for unread anemometer/wind alarms.
+        syncAlarm(unreadAnemometer);
         $id("np-total").textContent = unread;
         $id("mark-all-read").disabled = unread === 0;
         panel.querySelectorAll(".np-tab").forEach((t) => {
@@ -2359,15 +2379,34 @@ NOTIF_JS = r"""
             const d = await r.json();
             alerts = d.alerts || [];
             const maxId = alerts.length ? alerts[0].id : 0;
+            const wasAlreadyAlarming = unreadAnemometerNow > 0;
+            let newAlertArrived = false;
+            let newAnemometerAlertArrived = false;
+
             if (lastMax < 0) {
                 lastMax = maxId;                    // first visit: don't ring for old alerts
                 store.set("plc_alert_last_id", lastMax);
             } else if (maxId > lastMax) {
+                newAnemometerAlertArrived = alerts.some(
+                    (a) => a.id > lastMax && isAnemometerAlarm(a)
+                );
                 lastMax = maxId;                    // brand-new alert arrived
                 store.set("plc_alert_last_id", lastMax);
+                newAlertArrived = true;
                 ring();
             }
+
             render();
+
+            // If another anemometer alert arrives while one is already unread,
+            // play the MP3 immediately and restart the normal 5-second-gap cycle.
+            if (newAnemometerAlertArrived && wasAlreadyAlarming) {
+                if (alarmTimer) {
+                    clearTimeout(alarmTimer);
+                    alarmTimer = null;
+                }
+                playAlarm();
+            }
         } catch (e) { /* server down: keep last list */ }
     }
 
@@ -2754,8 +2793,6 @@ def home_page():
                  '<span><i style="background:#fca5a5"></i>Stopped</span></div>',
                  'Window: <b id="ov-hist-win">--</b>', 'Duty: <b id="ov-duty">--</b>',
                  icon_tone="violet", cls="span-2", body_cls="left")
-        + trend_widget("Power Trend", "Watts over the rolling window", "ov-pw-trend", "violet")
-        + trend_widget("Current Trend", "Amps over the rolling window", "ov-cu-trend", "red")
         + "</div>"
         + f'<div class="section-h"><span class="ic">{icon("trend")}</span>Time-Scale Graphs (Historical Data)</div>'
         + '<div class="widgets" style="grid-template-columns: 1fr;">'
@@ -3201,12 +3238,6 @@ def home_page():
         const duty = valid.length ? valid.filter(Boolean).length / valid.length * 100 : null;
         setText("ov-duty", duty === null ? "--" : duty.toFixed(0) + "%");
         setText("ov-hist-win", windowLabel(states.length));
-        Trend.draw("ov-pw-trend", series(h, "motor_power"), {color: "#7c3aed", decimals: 0, unit: " W"});
-        Trend.draw("ov-cu-trend", series(h, "motor_current"), {color: "#dc2626", decimals: 2, unit: " A"});
-        ["ov-pw-trend", "ov-cu-trend"].forEach((id) => {
-            setText(id + "-win", windowLabel(h.length));
-            setText(id + "-n", h.length);
-        });
         const conn = !!d.connected;
         setTile("load", ls);
         setTile("duty", duty === null ? ["idle", "No data"] : ["ok", duty.toFixed(0) + "% running"]);
