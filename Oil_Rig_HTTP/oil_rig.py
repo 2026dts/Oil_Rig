@@ -147,6 +147,12 @@ def init_db():
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_hourly_bucket ON hourly_agg(hour_bucket)')
+    # One row per hour: remove duplicates left by older versions, then enforce it.
+    cursor.execute('''
+        DELETE FROM hourly_agg WHERE id NOT IN (
+            SELECT MAX(id) FROM hourly_agg GROUP BY hour_bucket)
+    ''')
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_hourly_bucket_u ON hourly_agg(hour_bucket)')
     
     # Table 3: Daily aggregates
     cursor.execute('''
@@ -215,123 +221,94 @@ def insert_reading(temp, humidity, pressure, wind, voltage, current, power, moto
         print(f"[DB] Error inserting reading: {e}")
 
 
-def aggregate_hourly():
-    """Compute hourly averages from readings."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        now = time.time()
-        hour_ago = now - 3600
-        
-        cursor.execute('''
-            SELECT temperature, humidity, pressure, wind_speed, motor_voltage, 
-                   motor_current, motor_power, motor_state
-            FROM readings
-            WHERE timestamp > ? AND timestamp <= ?
-            ORDER BY timestamp
-        ''', (hour_ago, now))
-        
-        rows = cursor.fetchall()
-        if not rows:
-            conn.close()
-            return
-        
-        temps = [r[0] for r in rows if r[0] is not None]
-        humidities = [r[1] for r in rows if r[1] is not None]
-        pressures = [r[2] for r in rows if r[2] is not None]
-        winds = [r[3] for r in rows if r[3] is not None]
-        voltages = [r[4] for r in rows if r[4] is not None]
-        currents = [r[5] for r in rows if r[5] is not None]
-        powers = [r[6] for r in rows if r[6] is not None]
-        motor_running = sum(1 for r in rows if r[7] == 1)
-        
-        hour_bucket = int(now / 3600) * 3600
-        
-        cursor.execute('''
-            INSERT OR REPLACE INTO hourly_agg
-            (hour_bucket, temp_avg, humidity_avg, pressure_avg, wind_avg,
-             motor_voltage_avg, motor_current_avg, motor_power_avg, motor_running_count, sample_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            hour_bucket,
-            sum(temps) / len(temps) if temps else None,
-            sum(humidities) / len(humidities) if humidities else None,
-            sum(pressures) / len(pressures) if pressures else None,
-            sum(winds) / len(winds) if winds else None,
-            sum(voltages) / len(voltages) if voltages else None,
-            sum(currents) / len(currents) if currents else None,
-            sum(powers) / len(powers) if powers else None,
-            motor_running,
-            len(rows)
-        ))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[DB] Error in hourly aggregation: {e}")
+HOURLY_SQL = """
+    INSERT OR REPLACE INTO hourly_agg
+        (hour_bucket, temp_avg, humidity_avg, pressure_avg, wind_avg,
+         motor_voltage_avg, motor_current_avg, motor_power_avg, motor_running_count, sample_count)
+    SELECT CAST(timestamp / 3600 AS INTEGER) * 3600,
+           AVG(temperature), AVG(humidity), AVG(pressure), AVG(wind_speed),
+           AVG(motor_voltage), AVG(motor_current), AVG(motor_power),
+           SUM(motor_state = 1), COUNT(*)
+    FROM readings
+    WHERE timestamp >= ? AND timestamp < ?
+    GROUP BY CAST(timestamp / 3600 AS INTEGER)
+"""
+
+DAILY_SQL = """
+    INSERT OR REPLACE INTO daily_agg
+        (day_date, temp_min, temp_max, temp_avg, humidity_min, humidity_max, humidity_avg,
+         pressure_min, pressure_max, pressure_avg, wind_max, wind_avg,
+         motor_voltage_avg, motor_current_avg, motor_power_max, motor_power_avg,
+         motor_running_sec, sample_count)
+    SELECT date(timestamp, 'unixepoch', 'localtime') AS d,
+           MIN(temperature), MAX(temperature), AVG(temperature),
+           MIN(humidity), MAX(humidity), AVG(humidity),
+           MIN(pressure), MAX(pressure), AVG(pressure),
+           MAX(wind_speed), AVG(wind_speed),
+           AVG(motor_voltage), AVG(motor_current), MAX(motor_power), AVG(motor_power),
+           SUM(motor_state = 1) * ?, COUNT(*)
+    FROM readings
+    WHERE timestamp >= ?
+    GROUP BY d
+"""
+
+_agg_lock = threading.Lock()
 
 
-def aggregate_daily():
-    """Compute daily min/max/avg from hourly_agg."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        today = datetime.now().strftime('%Y-%m-%d')
-        day_start = int(datetime.strptime(today, '%Y-%m-%d').timestamp())
-        day_end = day_start + 86400
-        
-        cursor.execute('''
-            SELECT temp_avg, humidity_avg, pressure_avg, wind_avg, motor_power_avg, 
-                   motor_voltage_avg, motor_current_avg, motor_running_count, sample_count
-            FROM hourly_agg
-            WHERE hour_bucket >= ? AND hour_bucket < ?
-        ''', (day_start, day_end))
-        
-        rows = cursor.fetchall()
-        if not rows:
+def _local_day_start(days_ago=0):
+    day = datetime.now().date() - timedelta(days=days_ago)
+    return datetime.combine(day, datetime.min.time()).timestamp()
+
+
+def refresh_aggregates():
+    """Rebuild recent hourly and daily rows straight from the raw readings.
+
+    Hourly: every completed hour of the last 6 hours.
+    Daily:  yesterday and today (today is a running partial day).
+    Safe to run any time; rows are replaced, never duplicated.
+    """
+    with _agg_lock:
+        try:
+            now = time.time()
+            current_hour = int(now // 3600) * 3600
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            conn.execute(HOURLY_SQL, (current_hour - 6 * 3600, current_hour))
+            conn.execute(DAILY_SQL, (READ_INTERVAL_SEC, _local_day_start(1)))
+            conn.commit()
             conn.close()
-            return
-        
-        temps = [r[0] for r in rows if r[0] is not None]
-        humidities = [r[1] for r in rows if r[1] is not None]
-        pressures = [r[2] for r in rows if r[2] is not None]
-        winds = [r[3] for r in rows if r[3] is not None]
-        powers = [r[4] for r in rows if r[4] is not None]
-        voltages = [r[5] for r in rows if r[5] is not None]
-        currents = [r[6] for r in rows if r[6] is not None]
-        running_counts = [r[7] for r in rows if r[7] is not None]
-        
-        cursor.execute('''
-            INSERT OR REPLACE INTO daily_agg
-            (day_date, temp_min, temp_max, temp_avg, humidity_min, humidity_max, humidity_avg,
-             pressure_min, pressure_max, pressure_avg, wind_max, wind_avg,
-             motor_voltage_avg, motor_current_avg, motor_power_max, motor_power_avg, motor_running_sec, sample_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            today,
-            min(temps) if temps else None,
-            max(temps) if temps else None,
-            sum(temps) / len(temps) if temps else None,
-            min(humidities) if humidities else None,
-            max(humidities) if humidities else None,
-            sum(humidities) / len(humidities) if humidities else None,
-            min(pressures) if pressures else None,
-            max(pressures) if pressures else None,
-            sum(pressures) / len(pressures) if pressures else None,
-            max(winds) if winds else None,
-            sum(winds) / len(winds) if winds else None,
-            sum(voltages) / len(voltages) if voltages else None,
-            sum(currents) / len(currents) if currents else None,
-            max(powers) if powers else None,
-            sum(powers) / len(powers) if powers else None,
-            sum(running_counts) * READ_INTERVAL_SEC,
-            len(rows)
-        ))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[DB] Error in daily aggregation: {e}")
+        except Exception as e:
+            print(f"[DB] Error refreshing aggregates: {e}")
+
+
+def repair_aggregates_once():
+    """One-time repair for databases written by the old aggregation code,
+    which stored hourly rows under the wrong hour and daily rows for the
+    wrong day. Everything still covered by raw readings is rebuilt."""
+    with _agg_lock:
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            done = conn.execute(
+                "SELECT value FROM app_state WHERE key = 'agg_repaired_v2'").fetchone()
+            first = conn.execute("SELECT MIN(timestamp) FROM readings").fetchone()[0]
+            if done or first is None:
+                conn.close()
+                return
+            first_hour = int(first // 3600) * 3600
+            first_day = datetime.fromtimestamp(first).strftime('%Y-%m-%d')
+            current_hour = int(time.time() // 3600) * 3600
+
+            conn.execute("DELETE FROM hourly_agg WHERE hour_bucket >= ?", (first_hour,))
+            conn.execute("DELETE FROM daily_agg WHERE day_date >= ?", (first_day,))
+            conn.execute(HOURLY_SQL, (first_hour, current_hour))
+            conn.execute(DAILY_SQL, (READ_INTERVAL_SEC, first))
+            conn.execute("INSERT OR REPLACE INTO app_state (key, value) VALUES ('agg_repaired_v2', '1')")
+            conn.commit()
+            h = conn.execute("SELECT COUNT(*) FROM hourly_agg").fetchone()[0]
+            d = conn.execute("SELECT COUNT(*) FROM daily_agg").fetchone()[0]
+            conn.close()
+            print(f"[DB] Aggregates rebuilt from raw readings: {h} hourly rows, {d} daily rows")
+        except Exception as e:
+            print(f"[DB] Error repairing aggregates: {e}")
 
 
 def delete_old_readings(days=7):
@@ -374,6 +351,13 @@ RESTORE_PUMP_AFTER_RELAY = True
 RESTORE_SETTLE_SEC = 2             # wait after relay ON before checking the pump
 RESTORE_STABLE_SEC = 6             # pump must hold the state this long to count as restored
 RESTORE_TIMEOUT_SEC = 60           # give up re-sending the command after this long
+
+# While the relay cycle power-cycles the PLC link, keep showing the last known
+# pump status instead of "Offline". The hold ends at the first good PLC read
+# after relay ON. If the PLC is not back RELAY_OFFLINE_GRACE_SEC after relay ON,
+# "Offline" is shown as normal (a real fault is never hidden for long).
+RELAY_HIDE_OFFLINE = True
+RELAY_OFFLINE_GRACE_SEC = 30
 
 # ----------------------------------------------------------------------
 # WIDGET LIMITS  (edit these to match your equipment)
@@ -459,6 +443,8 @@ _wind_check_running = False
 _relay_off_active = False          # True between relay OFF and a confirmed relay ON
 _plc_read_seq = 0                  # increases on every successful PLC read
 _last_manual_command_at = 0.0      # time of last ON/OFF click on the dashboard
+_offline_hold_until = 0.0          # hide "Offline" until this time (relay cycle)
+_relay_on_at = 0.0                 # time the relay was last confirmed ON
 
 
 # ----------------------------------------------------------------------
@@ -534,14 +520,18 @@ def call_relay(url):
 
 
 def relay_on_with_retry():
-    global _relay_off_active
+    global _relay_off_active, _relay_on_at, _offline_hold_until
     for attempt in range(1, RELAY_ON_RETRIES + 1):
         if call_relay(RELAY_ON_URL):
             _relay_off_active = False
+            _relay_on_at = time.time()
+            if _offline_hold_until:
+                _offline_hold_until = _relay_on_at + RELAY_OFFLINE_GRACE_SEC
             return True
         print(f"[RELAY] ON attempt {attempt}/{RELAY_ON_RETRIES} failed")
         time.sleep(1)
     print("[RELAY] WARNING: relay ON was not confirmed. Check the relay manually.")
+    _offline_hold_until = 0.0   # relay may still be off: show the real status
     return False
 
 
@@ -598,11 +588,15 @@ def restore_pump_state(target, sequence_started):
 def relay_cycle_sequence(pump_before, reason):
     """Relay OFF -> wait -> relay ON, then restore the pump state.
     Runs in its own thread so polling and the web UI are never blocked."""
-    global _wind_check_running, _relay_off_active, _watch_resume_at
+    global _wind_check_running, _relay_off_active, _watch_resume_at, _offline_hold_until
     try:
         sequence_started = time.time()
         print(f"[WIND-WATCH] {reason}. Relay OFF for {RELAY_OFF_TIME_SEC} s.")
         _relay_off_active = True
+        if RELAY_HIDE_OFFLINE:
+            # covers OFF time + ON retries; shortened to the grace period once relay is ON
+            _offline_hold_until = time.time() + RELAY_OFF_TIME_SEC + \
+                RELAY_ON_RETRIES * (RELAY_HTTP_TIMEOUT + 1) + RELAY_OFFLINE_GRACE_SEC
         call_relay(RELAY_OFF_URL)
         try:
             time.sleep(RELAY_OFF_TIME_SEC)
@@ -928,10 +922,12 @@ def check_wind_alarm(data):
 
 
 def plc_polling_loop():
-    global _stale_count, _last_hour_agg, _last_day_agg
+    global _stale_count, _last_hour_agg, _last_day_agg, _offline_hold_until
 
     load_runtime_state()
     init_db()
+    repair_aggregates_once()
+    refresh_aggregates()
 
     while True:
         try:
@@ -947,6 +943,12 @@ def plc_polling_loop():
                     sample["t"] = data["last_update"]
                     history.append(sample)
 
+                # PLC is back after a relay cycle: stop hiding "Offline"
+                if _offline_hold_until and not _relay_off_active and \
+                        _relay_on_at and time.time() >= _relay_on_at:
+                    _offline_hold_until = 0.0
+                    print("[RELAY] PLC link back after relay cycle.")
+
                 # Insert into SQLite
                 insert_reading(
                     data["temperature"], data["humidity"], data["pressure"],
@@ -954,17 +956,16 @@ def plc_polling_loop():
                     data["motor_power"], data["motor_control"]
                 )
                 
-                # Hourly aggregation
+                # Hourly / daily aggregation (rebuilt from raw readings)
                 now_hour = int(time.time() / 3600)
                 if now_hour > _last_hour_agg:
                     _last_hour_agg = now_hour
-                    threading.Thread(target=aggregate_hourly, daemon=True).start()
-                
-                # Daily aggregation
+                    threading.Thread(target=refresh_aggregates, daemon=True).start()
+
+                # Purge raw readings older than 7 days, once a day
                 now_date = datetime.now().date()
                 if now_date > _last_day_agg:
                     _last_day_agg = now_date
-                    threading.Thread(target=aggregate_daily, daemon=True).start()
                     threading.Thread(target=lambda: delete_old_readings(7), daemon=True).start()
 
                 watch_wind(data)
@@ -1005,9 +1006,15 @@ def plc_polling_loop():
 
 def snapshot(keys=None):
     with data_lock:
-        if keys is None:
-            return dict(latest_data)
-        return {key: latest_data.get(key) for key in keys}
+        d = dict(latest_data)
+    # During a relay cycle the PLC link drops on purpose: keep showing the last
+    # known values instead of "Offline". `relay_reset` tells the page why.
+    if RELAY_HIDE_OFFLINE and not d.get("connected") and time.time() < _offline_hold_until:
+        d["connected"] = True
+        d["relay_reset"] = True
+    if keys is None:
+        return d
+    return {key: d.get(key) for key in keys}
 
 
 # ----------------------------------------------------------------------
@@ -1132,159 +1139,78 @@ def api_alert_read_all():
     return jsonify({"success": True})
 
 
+GRAPH_FIELDS = ("temperature", "humidity", "pressure", "wind", "power", "voltage", "current")
+
+
+def _graph_points(rows):
+    """rows: (timestamp, temperature, humidity, pressure, wind, power, voltage, current)"""
+    out = []
+    for r in rows:
+        point = {"timestamp": float(r[0])}
+        for name, v in zip(GRAPH_FIELDS, r[1:]):
+            point[name] = None if v is None else round(float(v), 3)
+        out.append(point)
+    return out
+
+
+def _readings_bucketed(conn, since, bucket_sec):
+    return conn.execute(f"""
+        SELECT CAST(timestamp / {bucket_sec} AS INTEGER) * {bucket_sec} AS t,
+               AVG(temperature), AVG(humidity), AVG(pressure), AVG(wind_speed),
+               AVG(motor_power), AVG(motor_voltage), AVG(motor_current)
+        FROM readings
+        WHERE timestamp >= ?
+        GROUP BY CAST(timestamp / {bucket_sec} AS INTEGER)
+        ORDER BY t
+    """, (since,)).fetchall()
+
+
 @app.get("/api/graph/<scale>")
 def api_graph(scale):
-    """Time-scale graph data: 1h, 1d, 1w, 1m, 1y."""
+    """Time-scale graph data. Every point has the same keys:
+    timestamp, temperature, humidity, pressure, wind, power, voltage, current.
+
+        1h  last hour,     raw readings (one point every 2 s)
+        1d  last 24 hours, 5-minute averages from readings
+        1w  last 7 days,   hourly averages from readings
+        1m  last 30 days,  hourly averages from hourly_agg
+        1y  last 365 days, daily averages from daily_agg
+    """
+    now = time.time()
     try:
-        metric = request.args.get('metric', 'temperature')
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        if scale == '1h':
-            # 1 Hour: raw readings data (every 2 seconds)
-            cursor.execute('''
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        if scale == "1h":
+            rows = conn.execute("""
                 SELECT timestamp, temperature, humidity, pressure, wind_speed,
-                       motor_voltage, motor_current, motor_power
-                FROM readings
-                WHERE timestamp >= (datetime('now') - 3600)
-                ORDER BY timestamp ASC
-            ''')
-            rows = cursor.fetchall()
-            
-            result = []
-            for row in rows:
-                result.append({
-                    'timestamp': float(row['timestamp']),
-                    'temperature': float(row['temperature']) if row['temperature'] is not None else None,
-                    'humidity': float(row['humidity']) if row['humidity'] is not None else None,
-                    'pressure': float(row['pressure']) if row['pressure'] is not None else None,
-                    'wind': float(row['wind_speed']) if row['wind_speed'] is not None else None,
-                    'power': float(row['motor_power']) if row['motor_power'] is not None else None,
-                    'voltage': float(row['motor_voltage']) if row['motor_voltage'] is not None else None,
-                    'current': float(row['motor_current']) if row['motor_current'] is not None else None,
-                })
-        
-        elif scale == '1d':
-            # 1 Day: hourly data
-            cursor.execute('''
+                       motor_power, motor_voltage, motor_current
+                FROM readings WHERE timestamp >= ? ORDER BY timestamp
+            """, (now - 3600,)).fetchall()
+        elif scale == "1d":
+            rows = _readings_bucketed(conn, now - 86400, 300)
+        elif scale == "1w":
+            rows = _readings_bucketed(conn, now - 7 * 86400, 3600)
+        elif scale == "1m":
+            rows = conn.execute("""
                 SELECT hour_bucket, temp_avg, humidity_avg, pressure_avg, wind_avg,
                        motor_power_avg, motor_voltage_avg, motor_current_avg
-                FROM hourly_agg
-                WHERE hour_bucket >= datetime('now', '-1 day')
-                ORDER BY hour_bucket ASC
-            ''')
-            rows = cursor.fetchall()
-            
-            result = []
-            for row in rows:
-                hour = int(row['hour_bucket'])
-                result.append({
-                    'timestamp': hour,
-                    'temperature': float(row['temp_avg']) if row['temp_avg'] is not None else None,
-                    'humidity': float(row['humidity_avg']) if row['humidity_avg'] is not None else None,
-                    'pressure': float(row['pressure_avg']) if row['pressure_avg'] is not None else None,
-                    'wind': float(row['wind_avg']) if row['wind_avg'] is not None else None,
-                    'power': float(row['motor_power_avg']) if row['motor_power_avg'] is not None else None,
-                    'voltage': float(row['motor_voltage_avg']) if row['motor_voltage_avg'] is not None else None,
-                    'current': float(row['motor_current_avg']) if row['motor_current_avg'] is not None else None,
-                })
-        
-        elif scale in ['1w', '1m']:
-            # 1 Week / 1 Month: daily data
-            days = 7 if scale == '1w' else 30
-            cursor.execute(f'''
-                SELECT day_date, temp_min, temp_max, temp_avg, humidity_min, humidity_max, humidity_avg,
-                       pressure_min, pressure_max, pressure_avg, wind_max, wind_avg, motor_power_avg
-                FROM daily_agg
-                WHERE day_date >= date('now', '-{days} days')
-                ORDER BY day_date ASC
-            ''')
-            rows = cursor.fetchall()
-            
-            result = []
-            for row in rows:
-                day_ts = int(datetime.strptime(row['day_date'], '%Y-%m-%d').timestamp())
-                result.append({
-                    'timestamp': day_ts,
-                    'date': row['day_date'],
-                    'temperature_min': float(row['temp_min']) if row['temp_min'] is not None else None,
-                    'temperature_max': float(row['temp_max']) if row['temp_max'] is not None else None,
-                    'temperature_avg': float(row['temp_avg']) if row['temp_avg'] is not None else None,
-                    'humidity_min': float(row['humidity_min']) if row['humidity_min'] is not None else None,
-                    'humidity_max': float(row['humidity_max']) if row['humidity_max'] is not None else None,
-                    'humidity_avg': float(row['humidity_avg']) if row['humidity_avg'] is not None else None,
-                    'pressure_min': float(row['pressure_min']) if row['pressure_min'] is not None else None,
-                    'pressure_max': float(row['pressure_max']) if row['pressure_max'] is not None else None,
-                    'pressure_avg': float(row['pressure_avg']) if row['pressure_avg'] is not None else None,
-                    'wind_max': float(row['wind_max']) if row['wind_max'] is not None else None,
-                    'wind_avg': float(row['wind_avg']) if row['wind_avg'] is not None else None,
-                    'power': float(row['motor_power_avg']) if row['motor_power_avg'] is not None else None,
-                    'voltage': float(row['motor_voltage_avg']) if row['motor_voltage_avg'] is not None else None,
-                    'current': float(row['motor_current_avg']) if row['motor_current_avg'] is not None else None,
-                })
-        
-        elif scale == '1y':
-            # 1 Year: weekly aggregation from daily data
-            cursor.execute('''
-                SELECT day_date, temp_min, temp_max, temp_avg, humidity_min, humidity_max, humidity_avg,
-                       pressure_min, pressure_max, pressure_avg, wind_max, wind_avg, motor_power_avg
-                FROM daily_agg
-                WHERE day_date >= date('now', '-365 days')
-                ORDER BY day_date ASC
-            ''')
-            rows = cursor.fetchall()
-            
-            # Resample to weekly
-            weekly = {}
-            for row in rows:
-                day_ts = datetime.strptime(row['day_date'], '%Y-%m-%d')
-                week_start = (day_ts - timedelta(days=day_ts.weekday())).date()
-                week_key = str(week_start)
-                
-                if week_key not in weekly:
-                    weekly[week_key] = {
-                        'temps': [], 'humidities': [], 'pressures': [],
-                        'winds': [], 'powers': [], 'voltages': [], 'currents': [], 'count': 0
-                    }
-                
-                if row['temperature_avg'] is not None:
-                    weekly[week_key]['temps'].append(row['temperature_avg'])
-                if row['humidity_avg'] is not None:
-                    weekly[week_key]['humidities'].append(row['humidity_avg'])
-                if row['pressure_avg'] is not None:
-                    weekly[week_key]['pressures'].append(row['pressure_avg'])
-                if row['wind_avg'] is not None:
-                    weekly[week_key]['winds'].append(row['wind_avg'])
-                if row['power'] is not None:
-                    weekly[week_key]['powers'].append(row['power'])
-                if row['voltage'] is not None:
-                    weekly[week_key]['voltages'].append(row['voltage'])
-                if row['current'] is not None:
-                    weekly[week_key]['currents'].append(row['current'])
-                weekly[week_key]['count'] += 1
-            
-            result = []
-            for week_str, data in sorted(weekly.items()):
-                week_ts = int(datetime.strptime(week_str, '%Y-%m-%d').timestamp())
-                result.append({
-                    'timestamp': week_ts,
-                    'week': week_str,
-                    'temperature_avg': sum(data['temps']) / len(data['temps']) if data['temps'] else None,
-                    'humidity_avg': sum(data['humidities']) / len(data['humidities']) if data['humidities'] else None,
-                    'pressure_avg': sum(data['pressures']) / len(data['pressures']) if data['pressures'] else None,
-                    'wind_avg': sum(data['winds']) / len(data['winds']) if data['winds'] else None,
-                    'power': sum(data['powers']) / len(data['powers']) if data['powers'] else None,
-                    'voltage': sum(data['voltages']) / len(data['voltages']) if data['voltages'] else None,
-                    'current': sum(data['currents']) / len(data['currents']) if data['currents'] else None,
-                })
-        
+                FROM hourly_agg WHERE hour_bucket >= ? ORDER BY hour_bucket
+            """, (now - 30 * 86400,)).fetchall()
+        elif scale == "1y":
+            day_rows = conn.execute("""
+                SELECT day_date, temp_avg, humidity_avg, pressure_avg, wind_avg,
+                       motor_power_avg, motor_voltage_avg, motor_current_avg
+                FROM daily_agg WHERE day_date >= date('now', 'localtime', '-365 days')
+                ORDER BY day_date
+            """).fetchall()
+            rows = [(datetime.strptime(r[0], "%Y-%m-%d").timestamp(),) + tuple(r[1:]) for r in day_rows]
+        else:
+            conn.close()
+            return jsonify({"error": "scale must be 1h, 1d, 1w, 1m or 1y"}), 400
         conn.close()
-        return jsonify({'scale': scale, 'data': result})
-    
+        return jsonify({"scale": scale, "data": _graph_points(rows)})
     except Exception as e:
         print(f"[API] Graph error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 # ----------------------------------------------------------------------
@@ -1792,7 +1718,7 @@ function dewPoint(t, rh) {
 }
 
 const Status = {
-    link(d) { return d && d.connected ? ["ok", "Online"] : ["bad", "Offline"]; },
+    link(d) { return d && d.connected ? ["ok", "Online"] : ["bad", "Processing"]; },
     motor(d) {
         if (!d || !d.connected) return ["idle", "Unknown"];
         return d.motor_control ? ["ok", "Running"] : ["warn", "Stopped"];
@@ -2079,7 +2005,7 @@ function statsOf(arr) {
 function status(d, serverDown) {
     const c = $("conn");
     if (c) c.classList.toggle("online", !!(d && d.connected));
-    setText("conn-text", serverDown ? "Dashboard offline" : (d && d.connected ? "PLC online" : "PLC offline"));
+    setText("conn-text", serverDown ? "Dashboard offline" : (d && d.connected ? "PLC online" : "Processing"));
     setText("conn-time", d && d.last_update ? d.last_update : "--");
     document.querySelectorAll(".js-poll").forEach((e) => {
         e.textContent = d && d.last_update ? d.last_update.split(" ")[1] : "--";
@@ -2112,7 +2038,7 @@ function renderMotor(p, d) {
     const on = !!d.motor_control, conn = !!d.connected;
     const st = $(p + "-state");
     if (st) {
-        st.textContent = conn ? (on ? "Running" : "Stopped") : "Offline";
+        st.textContent = conn ? (on ? "Running" : "Stopped") : "Processing";
         st.className = st.className.replace(/\b(ok|stop|idle)\b/g, "").trim() + " " + (conn ? (on ? "ok" : "stop") : "idle");
     }
     document.querySelectorAll("#" + p + "-seg button").forEach((b) => {
@@ -2214,9 +2140,6 @@ NOTIF_CSS = r"""
 .tb-bell.alarming{color:#fff;background:#dc2626;border-color:#dc2626;animation:bellPulse 1.2s ease-in-out infinite}
 .tb-bell.alarming svg{animation:bellRing 1s ease-in-out infinite;transform-origin:50% 2px}
 @keyframes bellPulse{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,.55)}50%{box-shadow:0 0 0 7px rgba(220,38,38,0)}}
-.tb-unlock{border:1px solid #fecaca;background:#fef2f2;color:#b91c1c;font-size:11.5px;font-weight:600;
-  padding:5px 10px;border-radius:8px;cursor:pointer;animation:bellPulse 1.2s ease-in-out infinite}
-.tb-unlock[hidden]{display:none}
 @media (max-width:640px){.tb-clock{display:none}.np{top:52px;right:8px}}
 """
 
@@ -2251,14 +2174,10 @@ NOTIF_JS = r"""
     const alarmAudio = new Audio("/audio/audio_alert.mp3");
     alarmAudio.preload = "auto";
     let alarmTimer = null, unreadAnemometerNow = 0;
+    let audioBlocked = false;   // browser refused autoplay; retried quietly
 
     function isAnemometerAlarm(a) {
         return a && !a.is_read && a.title === "Critical Wind Speed";
-    }
-
-    function setBlocked(b) {
-        const u = $id("sound-unlock");
-        if (u) u.hidden = !b;
     }
 
     function stopAlarmAudio() {
@@ -2288,12 +2207,12 @@ NOTIF_JS = r"""
 
         const p = alarmAudio.play();
         if (p && typeof p.then === "function") {
-            p.then(() => setBlocked(false)).catch(() => {
-                // Browser autoplay policy: one click/keypress may be required first.
-                setBlocked(true);
+            p.then(() => { audioBlocked = false; }).catch(() => {
+                audioBlocked = true;
+                // Browser blocked autoplay. Try again after the normal gap; it will
+                // succeed once autoplay is allowed for this site or after any click.
+                scheduleNextAlarm();
             });
-        } else {
-            setBlocked(false);
         }
     }
 
@@ -2316,13 +2235,17 @@ NOTIF_JS = r"""
                 alarmTimer = null;
             }
             stopAlarmAudio();
-            setBlocked(false);
+            audioBlocked = false;
         }
     }
 
     function unlockAudio() {
-        // A user interaction allows browsers to enable media playback.
-        if (unreadAnemometerNow > 0) playAlarm();
+        // A click / key press lets the browser play sound. Only start the MP3 here
+        // if it was blocked, so normal clicks don't restart a playing alarm.
+        if (unreadAnemometerNow > 0 && audioBlocked) {
+            if (alarmTimer) { clearTimeout(alarmTimer); alarmTimer = null; }
+            playAlarm();
+        }
     }
 
     ["pointerdown", "keydown", "touchstart"].forEach((ev) =>
@@ -2478,9 +2401,6 @@ BASE_HTML = """<!DOCTYPE html>
         <button type="button" id="notif-bell" class="tb-btn tb-bell" title="Alarms &amp; Alerts" aria-label="Alarms and alerts">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
             <span class="tb-badge" id="notif-count" hidden>0</span>
-        </button>
-        <button type="button" id="sound-unlock" class="tb-unlock" hidden title="Your browser blocked the alarm sound until you interact with the page">
-            &#128263; Click to enable alarm sound
         </button>
         <span class="tb-clock" id="tb-clock">--</span>
         <div class="conn" id="conn" role="status">
@@ -2956,8 +2876,12 @@ def home_page():
 
     function fmtTime(ts, spanSec) {
         const dt = new Date(ts * 1000);
-        if (spanSec <= 2 * 86400) {
+        if (spanSec <= 86400) {
             return dt.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', hour12: true});
+        }
+        if (spanSec <= 10 * 86400) {
+            return dt.toLocaleDateString('en-US', {month: 'short', day: 'numeric'}) + ', ' +
+                   dt.toLocaleTimeString('en-US', {hour: 'numeric', hour12: true});
         }
         return dt.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
     }
